@@ -237,9 +237,14 @@ def _torch_dtype(name: str):
 
 
 def render_non_thinking_ids(tokenizer, messages: list[dict[str, str]]) -> torch.Tensor:
-    """Return 1D prompt token ids, explicitly disabling Qwen3 thinking mode."""
+    """Return 1D prompt token ids, explicitly disabling Qwen3 thinking mode.
+
+    Transformers versions differ in what apply_chat_template(..., return_tensors="pt")
+    returns: older versions typically return a Tensor, while newer versions may
+    return a BatchEncoding. Handle both forms.
+    """
     try:
-        ids = tokenizer.apply_chat_template(
+        encoded = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
@@ -251,8 +256,26 @@ def render_non_thinking_ids(tokenizer, messages: list[dict[str, str]]) -> torch.
             "Tokenizer does not accept enable_thinking=False. Use a Qwen3-compatible "
             "Transformers/tokenizer version; this script refuses to silently enable thinking."
         ) from e
+
+    # transformers 5.x may return BatchEncoding instead of a bare tensor.
+    if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
+        try:
+            ids = encoded["input_ids"]
+        except (KeyError, TypeError):
+            ids = encoded.input_ids
+    else:
+        ids = encoded
+
+    if not torch.is_tensor(ids):
+        ids = torch.as_tensor(ids, dtype=torch.long)
+
     if ids.ndim == 2:
         ids = ids[0]
+    elif ids.ndim != 1:
+        raise RuntimeError(
+            f"Unexpected input_ids shape from apply_chat_template: {tuple(ids.shape)}"
+        )
+
     return ids.to(dtype=torch.long)
 
 
