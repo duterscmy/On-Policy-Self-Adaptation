@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Top-K violation study for Qwen3.
+Top-K violation study for Qwen3 (pure Transformers backend; no vLLM required).
 
 Question:
     Does sampling a token outside the model's own Top-K candidate set
@@ -30,8 +30,8 @@ import numpy as np
 import pandas as pd
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 AIME24_REVISION = "1c625e328db94ec7ef7ff169016b097c468d60b9"
 OPSA_PRESET = dict(temperature=0.7, top_p=0.8, top_k=20, max_tokens=32768)
@@ -58,11 +58,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--primary-k", type=int, default=10)
     p.add_argument("--prefix-tokens", type=str, default=",".join(map(str, DEFAULT_PREFIXES)))
     p.add_argument("--bootstrap-reps", type=int, default=2000)
-    p.add_argument("--tp-size", type=int, default=1)
-    p.add_argument("--dtype", default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"])
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
-    p.add_argument("--max-model-len", type=int, default=None)
-    p.add_argument("--prompt-batch-size", type=int, default=16)
+    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--generation-batch-size", type=int, default=8,
+                   help="Number of sampled completions generated together for one prompt")
+    p.add_argument("--rank-chunk-size", type=int, default=64,
+                   help="Completion-token chunk size for exact post-hoc rank scoring")
+    p.add_argument("--attn-implementation", default="sdpa",
+                   choices=["sdpa", "eager", "flash_attention_2"])
+    p.add_argument("--include-eos-rank", action="store_true",
+                   help="Include the sampled EOS token in rank statistics (default: exclude)")
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--no-plots", action="store_true")
@@ -224,26 +228,113 @@ def render_non_thinking(tokenizer, messages: list[dict[str, str]]) -> str:
         ) from e
 
 
-def normalize_rank(rank: Any) -> int:
-    r = int(rank)
-    return 1 if r == 0 else r
+def _torch_dtype(name: str):
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
 
 
-def extract_selected_ranks_and_logps(completion) -> tuple[list[int], list[float]]:
-    if completion.logprobs is None:
-        raise RuntimeError("vLLM returned no logprobs")
-    token_ids = list(completion.token_ids)
-    if len(token_ids) != len(completion.logprobs):
-        raise RuntimeError("token_ids/logprobs length mismatch")
-    ranks, logps = [], []
-    for tok_id, lp_dict in zip(token_ids, completion.logprobs):
-        chosen = lp_dict.get(int(tok_id))
-        if chosen is None:
-            raise RuntimeError(f"Chosen token {tok_id} missing from vLLM logprobs")
-        ranks.append(normalize_rank(chosen.rank))
-        logps.append(float(chosen.logprob))
-    return ranks, logps
+def render_non_thinking_ids(tokenizer, messages: list[dict[str, str]]) -> torch.Tensor:
+    """Return 1D prompt token ids, explicitly disabling Qwen3 thinking mode."""
+    try:
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_tensors="pt",
+        )
+    except TypeError as e:
+        raise RuntimeError(
+            "Tokenizer does not accept enable_thinking=False. Use a Qwen3-compatible "
+            "Transformers/tokenizer version; this script refuses to silently enable thinking."
+        ) from e
+    if ids.ndim == 2:
+        ids = ids[0]
+    return ids.to(dtype=torch.long)
 
+
+def _rank_and_optional_logp(logits: torch.Tensor, target_ids: torch.Tensor, want_logp: bool):
+    """Exact 1-based vocabulary rank for targets under untruncated model logits."""
+    if logits.ndim == 1:
+        logits = logits.unsqueeze(0)
+    target_ids = target_ids.reshape(-1).to(logits.device)
+    chosen = logits.gather(1, target_ids[:, None]).squeeze(1)
+    ranks = 1 + (logits > chosen[:, None]).sum(dim=1)
+    if want_logp:
+        logps = torch.log_softmax(logits.float(), dim=-1).gather(1, target_ids[:, None]).squeeze(1)
+        return ranks.cpu().tolist(), logps.cpu().tolist()
+    return ranks.cpu().tolist(), []
+
+
+@torch.inference_mode()
+def exact_generated_token_ranks(
+    model,
+    prompt_ids: torch.Tensor,
+    generated_ids: torch.Tensor,
+    chunk_size: int,
+    want_logp: bool,
+) -> tuple[list[int], list[float]]:
+    """
+    Compute exact sampled-token vocabulary ranks *after generation*.
+
+    This avoids asking generate() to retain a [time x vocab] score tensor. We
+    teacher-force the realized trajectory with KV cache and compare each sampled
+    token's logit with the full vocabulary. Temperature does not affect rank.
+    """
+    device = next(model.parameters()).device
+    prompt_ids = prompt_ids.to(device)
+    generated_ids = generated_ids.to(device)
+    if generated_ids.numel() == 0:
+        return [], []
+
+    out = model(input_ids=prompt_ids.unsqueeze(0), use_cache=True, return_dict=True)
+    past = out.past_key_values
+    prev_logits = out.logits[0, -1, :]
+    del out
+
+    all_ranks: list[int] = []
+    all_logps: list[float] = []
+    T = int(generated_ids.numel())
+    start = 0
+    while start < T:
+        end = min(T, start + chunk_size)
+        chunk = generated_ids[start:end]
+
+        # prev_logits predicts generated_ids[start].
+        ranks, logps = _rank_and_optional_logp(prev_logits, chunk[:1], want_logp)
+        all_ranks.extend(ranks)
+        all_logps.extend(logps)
+
+        out = model(
+            input_ids=chunk.unsqueeze(0),
+            past_key_values=past,
+            use_cache=True,
+            return_dict=True,
+        )
+        logits = out.logits[0]  # logits[j] predicts token after chunk[j]
+        past = out.past_key_values
+
+        if chunk.numel() > 1:
+            ranks, logps = _rank_and_optional_logp(logits[:-1], chunk[1:], want_logp)
+            all_ranks.extend(ranks)
+            all_logps.extend(logps)
+        prev_logits = logits[-1]
+        del out, logits
+        start = end
+
+    return all_ranks, all_logps
+
+
+def truncate_at_eos(ids: torch.Tensor, eos_ids: set[int], include_eos: bool) -> torch.Tensor:
+    xs = ids.tolist()
+    for i, tok in enumerate(xs):
+        if int(tok) in eos_ids:
+            end = i + 1 if include_eos else i
+            return ids[:end]
+    return ids
 
 def default_n(dataset: str) -> int:
     return {"aime24": 32, "math500": 8, "gpqa_diamond": 8}[dataset]
@@ -293,30 +384,24 @@ def run_rollouts(args: argparse.Namespace, rows: list[dict[str, Any]], out_dir: 
             "Use tail_analysis for the core study."
         )
 
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
-    llm_kwargs = dict(
-        model=args.model,
-        tensor_parallel_size=args.tp_size,
-        dtype=args.dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=args.trust_remote_code,
-    )
-    if args.max_model_len is not None:
-        llm_kwargs["max_model_len"] = args.max_model_len
-    llm = LLM(**llm_kwargs)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. This script expects a GPU.")
 
-    # vLLM always returns the chosen token and its exact vocabulary rank when
-    # logprobs is requested. logprobs=1 therefore avoids large top-N payloads.
-    sp = SamplingParams(
-        n=n_samples,
-        temperature=sampling["temperature"],
-        top_p=sampling["top_p"],
-        top_k=sampling["top_k"],
-        min_p=0.0,
-        max_tokens=sampling["max_tokens"],
-        logprobs=1,
-        seed=args.seed,
-    )
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=_torch_dtype(args.dtype),
+        trust_remote_code=args.trust_remote_code,
+        attn_implementation=args.attn_implementation,
+    ).to("cuda").eval()
+
+    eos = model.generation_config.eos_token_id
+    if eos is None:
+        eos = tok.eos_token_id
+    eos_ids = {int(x) for x in (eos if isinstance(eos, (list, tuple)) else [eos]) if x is not None}
 
     raw_path = out_dir / "raw_rollouts.jsonl.gz"
     completed = load_completed_problem_ids(raw_path, n_samples) if args.resume else set()
@@ -324,36 +409,89 @@ def run_rollouts(args: argparse.Namespace, rows: list[dict[str, Any]], out_dir: 
     pending = [r for r in rows if r["problem_id"] not in completed]
     print(f"[rollout] prompts={len(rows)} complete={len(completed)} pending={len(pending)}")
     print(f"[rollout] model={args.model}; sampling={sampling}; n={n_samples}; non-thinking=True")
+    print(f"[backend] HuggingFace Transformers on {torch.cuda.get_device_name(0)}")
+
+    model_max = int(getattr(model.config, "max_position_embeddings", 10**9))
 
     with gzip.open(raw_path, mode, encoding="utf-8") as wf:
-        for chunk in iter_chunks(pending, args.prompt_batch_size):
-            prompts = [render_non_thinking(tok, r["messages"]) for r in chunk]
-            req_outputs = llm.generate(prompts, sp, use_tqdm=True)
-            for row, req in zip(chunk, req_outputs):
-                for sample_id, comp in enumerate(req.outputs):
-                    ranks, logps = extract_selected_ranks_and_logps(comp)
-                    correct, score_error = score_response(row["task"], comp.text, row["gold"])
+        for row_i, row in enumerate(pending):
+            prompt_ids_cpu = render_non_thinking_ids(tok, row["messages"])
+            prompt_len = int(prompt_ids_cpu.numel())
+            room = max(1, model_max - prompt_len)
+            max_new = min(int(sampling["max_tokens"]), room)
+            if max_new < sampling["max_tokens"]:
+                warnings.warn(
+                    f"{row['problem_id']}: capping max_new_tokens {sampling['max_tokens']} -> {max_new} "
+                    f"to stay within model context {model_max}."
+                )
+
+            sample_id = 0
+            while sample_id < n_samples:
+                m = min(args.generation_batch_size, n_samples - sample_id)
+                # Deterministic but different stream across prompt/microbatch.
+                local_seed = args.seed + row_i * 100003 + sample_id
+                torch.manual_seed(local_seed)
+                torch.cuda.manual_seed_all(local_seed)
+
+                prompt_ids = prompt_ids_cpu.unsqueeze(0).to("cuda")
+                with torch.inference_mode():
+                    seqs = model.generate(
+                        input_ids=prompt_ids,
+                        do_sample=True,
+                        num_return_sequences=m,
+                        temperature=float(sampling["temperature"]),
+                        top_p=float(sampling["top_p"]),
+                        top_k=(0 if int(sampling["top_k"]) < 0 else int(sampling["top_k"])),
+                        max_new_tokens=max_new,
+                        use_cache=True,
+                        pad_token_id=tok.pad_token_id,
+                        eos_token_id=list(eos_ids) if len(eos_ids) > 1 else (next(iter(eos_ids)) if eos_ids else None),
+                    )
+
+                # All sequences begin with the same unpadded prompt because generation is
+                # batched only across samples of one benchmark question.
+                for j in range(m):
+                    full = seqs[j].detach().cpu()
+                    generated = full[prompt_len:]
+                    content_ids = truncate_at_eos(generated, eos_ids, include_eos=args.include_eos_rank)
+                    response_ids = truncate_at_eos(generated, eos_ids, include_eos=False)
+
+                    ranks, logps = exact_generated_token_ranks(
+                        model,
+                        prompt_ids_cpu,
+                        content_ids,
+                        chunk_size=args.rank_chunk_size,
+                        want_logp=args.store_logprobs,
+                    )
+                    text = tok.decode(response_ids, skip_special_tokens=True)
+                    correct, score_error = score_response(row["task"], text, row["gold"])
                     rec = {
                         "model": args.model,
                         "dataset": args.dataset,
                         "problem_id": row["problem_id"],
-                        "sample_id": sample_id,
+                        "sample_id": sample_id + j,
                         "correct": int(correct),
                         "score_error": score_error,
                         "gold": row["gold"],
                         "num_tokens": len(ranks),
-                        "finish_reason": getattr(comp, "finish_reason", None),
+                        "finish_reason": "eos" if len(response_ids) < len(generated) else "length",
                         "token_ranks": ranks,
-                        "response": comp.text,
+                        "response": text,
                         "sampling": sampling,
                         "non_thinking": True,
+                        "backend": "transformers_posthoc_rank",
+                        "include_eos_rank": bool(args.include_eos_rank),
                     }
                     if args.store_logprobs:
                         rec["sampled_token_logprobs"] = logps
                     wf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            wf.flush()
-    return raw_path
+                    wf.flush()
 
+                sample_id += m
+                del seqs, prompt_ids
+                torch.cuda.empty_cache()
+
+    return raw_path
 
 def read_raw(raw_path: Path) -> list[dict[str, Any]]:
     out = []

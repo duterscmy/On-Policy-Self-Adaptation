@@ -1,5 +1,17 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+#SBATCH --job-name="topk_violation_study"
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:4
+#SBATCH --time=24:00:00
+#SBATCH -o slurm.%j.%N.out
+#SBATCH -e slurm.%j.%N.err
+
+set -eo pipefail
+
+source ~/.bashrc
+conda activate topk-study
+set -u
 
 OUT_ROOT="${OUT_ROOT:-outputs/topk_violation}"
 TP_SIZE="${TP_SIZE:-1}"
