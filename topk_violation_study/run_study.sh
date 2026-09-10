@@ -10,13 +10,13 @@
 set -eo pipefail
 
 source ~/.bashrc
-conda activate topk-study
+conda activate topk-vllm085
 set -u
 
 OUT_ROOT="${OUT_ROOT:-outputs/topk_violation}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
-K_VALUES="${K_VALUES:-1,2,5,10,20,50,100}"
+K_VALUES="${K_VALUES:-1,2,3,5,10,20,50}"
 PRIMARY_K="${PRIMARY_K:-10}"
 PREFIX_TOKENS="${PREFIX_TOKENS:-32,64,128,256}"
 BOOTSTRAP_REPS="${BOOTSTRAP_REPS:-2000}"

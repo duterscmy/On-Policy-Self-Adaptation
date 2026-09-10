@@ -10,7 +10,7 @@
 set -eo pipefail
 
 source ~/.bashrc
-conda activate topk-study
+conda activate topk-vllm085
 set -u
 
 # Exact OPSA-style base-model AIME24 sampling sanity check.
@@ -22,7 +22,7 @@ for model in Qwen/Qwen3-1.7B Qwen/Qwen3-4B; do
     --dataset aime24 \
     --samples-per-prompt 32 \
     --sampling-preset opsa \
-    --k-values 1,2,5,10 \
+    --k-values 1,2,3,5,10 \
     --primary-k 10 \
     --prefix-tokens 32,64,128 \
     --output-dir "outputs/opsa_sanity/${short_model}/aime24"
