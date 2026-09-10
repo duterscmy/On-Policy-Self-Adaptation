@@ -44,7 +44,6 @@ run_one () {
     --primary-k "${PRIMARY_K}" \
     --prefix-tokens "${PREFIX_TOKENS}" \
     --bootstrap-reps "${BOOTSTRAP_REPS}" \
-    --tp-size "${TP_SIZE}" \
     --output-dir "${out}" \
     --resume
 }
