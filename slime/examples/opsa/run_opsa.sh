@@ -1,7 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name="opas_train"
+#SBATCH --job-name="opsa_train"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
 #SBATCH -o slurm.%j.%N.out
@@ -9,10 +10,30 @@
 
 set -eo pipefail
 
-source ~/.bashrc
+# Slurm batch shells are non-interactive; initialize Conda explicitly.
+source /home/u6os/cmy9797.u6os/miniconda3/etc/profile.d/conda.sh
 conda activate opsa
 
-# set -euo pipefail
+# Runtime environment required by Transformer Engine / Triton on GH200 (aarch64).
+# NCCL is header-only here on purpose: do NOT prepend the HPC SDK NCCL 2.19.3
+# library to LD_LIBRARY_PATH because PyTorch 2.6.0+cu126 was built with NCCL 2.21.5.
+export HPC_SDK=/opt/nvidia/hpc_sdk/Linux_aarch64/24.11
+export CUDA_HOME="$HPC_SDK/cuda/12.6"
+export MATHLIB_HOME="$HPC_SDK/math_libs/12.6"
+export NCCL_INCLUDE="$HPC_SDK/comm_libs/12.6/nccl/include"
+export PATH="$CUDA_HOME/bin:/usr/sbin:/sbin:$PATH"
+
+export CUDNN_ROOT="$(python - <<'PY_CUDNN'
+from importlib.metadata import distribution
+print(distribution("nvidia-cudnn-cu12").locate_file("nvidia/cudnn"))
+PY_CUDNN
+)"
+
+export CPATH="$NCCL_INCLUDE:$CUDNN_ROOT/include:$MATHLIB_HOME/include:$CUDA_HOME/include${CPATH:+:$CPATH}"
+export CPLUS_INCLUDE_PATH="$CPATH"
+export LIBRARY_PATH="$CUDNN_ROOT/lib:$MATHLIB_HOME/lib64:$CUDA_HOME/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$CUDNN_ROOT/lib:$MATHLIB_HOME/lib64:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TORCH_CUDA_ARCH_LIST=9.0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
@@ -23,6 +44,8 @@ OPSA_ROOT="${OPSA_ROOT:-$(cd -- "${SLIME_ROOT}/.." >/dev/null 2>&1 && pwd)}"
 MINGYU_ROOT="${MINGYU_ROOT:-$(cd -- "${OPSA_ROOT}/.." >/dev/null 2>&1 && pwd)}"
 OPSA_DATA_DIR="${OPSA_DATA_DIR:-${OPSA_ROOT}/data}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${OPSA_ROOT}/outputs}"
+TRITON_HOME="${TRITON_HOME:-${MINGYU_ROOT}/.triton}"
+export TRITON_HOME
 
 MODEL="${MODEL:-qwen3-1.7b}"
 PRESET="${PRESET:-topk}"
@@ -40,8 +63,9 @@ PROMPT_DATA="${PROMPT_DATA:-${OPSA_DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl}"
 EVAL_DATA="${EVAL_DATA:-${OPSA_DATA_DIR}/aime-2024/aime-2024.jsonl}"
 MEGATRON_PATH="${MEGATRON_PATH:-${MINGYU_ROOT}/models/Megatron-LM}"
 RAY_ADDRESS="${RAY_ADDRESS:-}"
-RAY_PORT="${RAY_PORT:-6379}"
-DASHBOARD_PORT="${DASHBOARD_PORT:-8265}"
+# Job-specific ports avoid collisions when multiple Slurm jobs land on the same node.
+RAY_PORT="${RAY_PORT:-$((20000 + ${SLURM_JOB_ID:-0} % 10000))}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-$((30000 + ${SLURM_JOB_ID:-0} % 10000))}"
 WANDB_PROJECT="${WANDB_PROJECT:-}"
 WANDB_GROUP="${WANDB_GROUP:-}"
 WANDB_TEAM="${WANDB_TEAM:-}"
@@ -601,6 +625,20 @@ TRAIN_COMMAND=(
    "${MISC_ARGS[@]}"
 )
 
+# Fail early inside the allocated Slurm node if the CUDA stack is not visible.
+if [ "$DRY_RUN" = false ]; then
+python3 - <<'PY_PREFLIGHT'
+import torch, triton, transformer_engine, transformer_engine.pytorch, apex
+import fused_weight_gradient_mlp_cuda
+print("[preflight] torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("[preflight] GPU:", torch.cuda.get_device_name(0))
+print("[preflight] Triton:", triton.__version__)
+print("[preflight] TE:", transformer_engine.__version__)
+print("[preflight] Apex fused_weight_gradient_mlp_cuda: OK")
+print("[preflight] visible GPUs:", torch.cuda.device_count())
+PY_PREFLIGHT
+fi
+
 HAS_NVLINK=0
 if [ "$DRY_RUN" = false ] && [ -z "$RAY_ADDRESS" ]; then
    GPU_TOPOLOGY="$(nvidia-smi topo -m 2>/dev/null || true)"
@@ -609,10 +647,25 @@ if [ "$DRY_RUN" = false ] && [ -z "$RAY_ADDRESS" ]; then
    fi
 fi
 
-RUNTIME_PYTHONPATH="${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+RUNTIME_PYTHONPATH="${SLIME_ROOT}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 export RUNTIME_PYTHONPATH HAS_NVLINK
 RUNTIME_ENV_JSON="$(
-   python3 -c 'import json, os; print(json.dumps({"env_vars": {"PYTHONPATH": os.environ["RUNTIME_PYTHONPATH"], "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_NVLS_ENABLE": os.environ["HAS_NVLINK"], "SGLANG_DISABLE_CUDNN_CHECK": "1"}}))'
+python3 - <<'PY_RUNTIME_ENV'
+import json, os
+keys = [
+    "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "CPLUS_INCLUDE_PATH",
+    "CUDA_HOME", "MATHLIB_HOME", "NCCL_INCLUDE", "CUDNN_ROOT",
+    "TRITON_HOME", "TORCH_CUDA_ARCH_LIST",
+]
+env = {k: os.environ[k] for k in keys if k in os.environ}
+env.update({
+    "PYTHONPATH": os.environ["RUNTIME_PYTHONPATH"],
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NCCL_NVLS_ENABLE": os.environ["HAS_NVLINK"],
+    "SGLANG_DISABLE_CUDNN_CHECK": "1",
+})
+print(json.dumps({"env_vars": env}))
+PY_RUNTIME_ENV
 )"
 
 echo "Model:               $MODEL_DISPLAY_NAME"
