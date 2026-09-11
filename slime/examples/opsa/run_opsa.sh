@@ -688,46 +688,24 @@ else
    echo "W&B:                 disabled"
 fi
 
-# Ray Jobs normally packages --working-dir before submission.  On this cluster the
-# project is already on a shared filesystem, so packaging the whole Slime checkout is
-# unnecessary and can time out at the dashboard (HTTP 504).  Instead, create a tiny
-# launcher on the shared filesystem and submit that absolute path.
-RAY_LAUNCH_DIR="${OPSA_ROOT}/.ray_launchers"
-RAY_LAUNCHER="${RAY_LAUNCH_DIR}/opsa_${SLURM_JOB_ID:-$$}.sh"
-
-make_ray_launcher() {
-   mkdir -p "$RAY_LAUNCH_DIR"
-   {
-      echo '#!/bin/bash'
-      echo 'set -e'
-      printf 'cd %q\n' "$SLIME_ROOT"
-      printf 'exec'
-      printf ' %q' "${TRAIN_COMMAND[@]}"
-      printf '\n'
-   } > "$RAY_LAUNCHER"
-   chmod 700 "$RAY_LAUNCHER"
-}
+# On this Slurm cluster we deliberately do NOT use `ray job submit`.
+# The Ray Jobs dashboard API has been returning HTTP 504 even when no working-dir
+# package is uploaded.  Since this is a single-node Slurm allocation, run the
+# driver directly inside the allocation and connect it to the local Ray head via
+# the GCS address.  This removes the dashboard/job-submission layer entirely.
 
 if [ "$DRY_RUN" = true ]; then
-   if [ -n "$RAY_ADDRESS" ]; then
-      DRY_RAY_ADDRESS="$RAY_ADDRESS"
-      echo "Ray:                 existing cluster at $RAY_ADDRESS"
-   else
-      DRY_RAY_ADDRESS="http://127.0.0.1:${DASHBOARD_PORT}"
-      echo "Ray:                 start local cluster with $TOTAL_GPUS GPUs (GCS $RAY_PORT, dashboard $DASHBOARD_PORT)"
-   fi
-   echo "Ray packaging:       disabled (shared filesystem launcher)"
-   printf '\n[dry-run] launcher command:'
+   echo "Ray launch mode:     direct driver (no Ray Jobs API)"
+   printf '\n[dry-run] ray start:'
+   printf ' %q' ray start --head --node-ip-address 127.0.0.1 --port "$RAY_PORT" --num-gpus "$TOTAL_GPUS" --disable-usage-stats --include-dashboard=false
+   printf '\n[dry-run] train:'
    printf ' %q' "${TRAIN_COMMAND[@]}"
-   printf '\n[dry-run] ray submit:'
-   printf ' %q' ray job submit --address "$DRY_RAY_ADDRESS" --runtime-env-json "$RUNTIME_ENV_JSON" -- /bin/bash "$RAY_LAUNCHER"
    printf '\n'
    exit 0
 fi
 
 RAY_STARTED_BY_SCRIPT=false
 cleanup() {
-   rm -f "${RAY_LAUNCHER:-}" >/dev/null 2>&1 || true
    if [ "$RAY_STARTED_BY_SCRIPT" = true ]; then
       ray stop --force >/dev/null 2>&1 || true
    fi
@@ -736,6 +714,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# This launcher is designed for a fresh single-node Slurm allocation.  If a
+# RAY_ADDRESS was explicitly supplied, use that GCS address; otherwise start a
+# local head.  For local runs we do not need the Ray dashboard at all.
 if [ -z "$RAY_ADDRESS" ]; then
    ray start \
       --head \
@@ -743,20 +724,68 @@ if [ -z "$RAY_ADDRESS" ]; then
       --port "$RAY_PORT" \
       --num-gpus "$TOTAL_GPUS" \
       --disable-usage-stats \
-      --dashboard-host 127.0.0.1 \
-      --dashboard-port "$DASHBOARD_PORT"
+      --include-dashboard=false
    RAY_STARTED_BY_SCRIPT=true
-   RAY_ADDRESS="http://127.0.0.1:${DASHBOARD_PORT}"
+   RAY_GCS_ADDRESS="127.0.0.1:${RAY_PORT}"
 else
-   echo "Using existing Ray cluster: $RAY_ADDRESS"
+   # Accept either a raw GCS address (host:port) or ray://host:port here.
+   # HTTP dashboard URLs are intentionally not supported in direct-driver mode.
+   case "$RAY_ADDRESS" in
+      http://*|https://*)
+         die "direct Ray mode needs a GCS address such as 127.0.0.1:${RAY_PORT}, not a dashboard URL ($RAY_ADDRESS)"
+         ;;
+      ray://*) RAY_GCS_ADDRESS="${RAY_ADDRESS#ray://}" ;;
+      *)       RAY_GCS_ADDRESS="$RAY_ADDRESS" ;;
+   esac
+   echo "Using existing Ray cluster GCS: $RAY_GCS_ADDRESS"
 fi
 
-make_ray_launcher
+# The driver itself also needs the same import/library environment that the Ray
+# workers receive.
+export PYTHONPATH="$RUNTIME_PYTHONPATH"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_NVLS_ENABLE="$HAS_NVLINK"
+export SGLANG_DISABLE_CUDNN_CHECK=1
+export RAY_GCS_ADDRESS
 
-echo "Ray packaging:       disabled (shared filesystem launcher)"
-echo "Ray launcher:        $RAY_LAUNCHER"
+cd "$SLIME_ROOT"
 
-ray job submit \
-   --address "$RAY_ADDRESS" \
-   --runtime-env-json "$RUNTIME_ENV_JSON" \
-   -- /bin/bash "$RAY_LAUNCHER"
+echo "Ray launch mode:     direct driver (no Ray Jobs API)"
+echo "Ray GCS address:     $RAY_GCS_ADDRESS"
+echo "Starting Slime driver directly..."
+
+# Explicitly connect the driver to the Ray head before executing train.py.
+# train.py itself uses Ray but does not call ray.init(), so the small wrapper
+# below makes the connection deterministic and supplies the runtime env to all
+# Ray actors/workers.
+"${CONDA_PREFIX}/bin/python" -u - "$SLIME_ROOT/train.py" "${TRAIN_COMMAND[@]:2}" <<'PY_DIRECT_DRIVER'
+import os
+import runpy
+import sys
+import ray
+
+train_py = sys.argv[1]
+train_args = sys.argv[2:]
+
+runtime_keys = [
+    "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "CPLUS_INCLUDE_PATH",
+    "CUDA_HOME", "MATHLIB_HOME", "NCCL_INCLUDE", "CUDNN_ROOT",
+    "TRITON_HOME", "TORCH_CUDA_ARCH_LIST", "PYTHONPATH",
+    "CUDA_DEVICE_MAX_CONNECTIONS", "NCCL_NVLS_ENABLE",
+    "SGLANG_DISABLE_CUDNN_CHECK",
+]
+runtime_env = {
+    "env_vars": {k: os.environ[k] for k in runtime_keys if k in os.environ}
+}
+
+print(f"[ray] connecting driver to {os.environ['RAY_GCS_ADDRESS']}", flush=True)
+ray.init(
+    address=os.environ["RAY_GCS_ADDRESS"],
+    runtime_env=runtime_env,
+    log_to_driver=True,
+)
+print("[ray] driver connected", flush=True)
+
+sys.argv = [train_py, *train_args]
+runpy.run_path(train_py, run_name="__main__")
+PY_DIRECT_DRIVER
