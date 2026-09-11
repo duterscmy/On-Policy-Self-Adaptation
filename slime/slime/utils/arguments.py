@@ -947,15 +947,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsa-mode",
                 type=str,
-                choices=["entropy", "fixed"],
+                choices=["entropy", "fixed", "topk"],
                 default="entropy",
-                help="Assign entropy-ranked or fixed advantages to selected lowest-logp tokens.",
+                help=(
+                    "Assign entropy-ranked/fixed advantages to lowest-logp tokens, "
+                    "or suppress sampled tokens outside the actor Top-K."
+                ),
             )
             parser.add_argument(
                 "--opsa-token-fraction",
                 type=float,
                 default=0.2,
                 help="Fraction of valid response tokens selected by lowest actor log-probability.",
+            )
+            parser.add_argument(
+                "--opsa-top-k",
+                type=int,
+                default=10,
+                help="For --opsa-mode=topk, suppress sampled response tokens whose actor rank is larger than K.",
             )
             parser.add_argument(
                 "--opsa-advantage-min",
@@ -973,7 +982,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--opsa-fixed-advantage",
                 type=float,
                 default=None,
-                help="Non-zero advantage required by --opsa-mode=fixed.",
+                help="Non-zero advantage required by --opsa-mode=fixed/topk.",
             )
             return parser
 

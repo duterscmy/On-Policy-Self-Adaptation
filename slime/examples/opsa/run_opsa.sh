@@ -8,6 +8,10 @@ SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
 MODEL="qwen3-1.7b"
 PRESET="opsa"
 TOKEN_FRACTION="0.2"
+TOP_K="${TOP_K:-10}"
+TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
+ACTOR_GPUS_OVERRIDE="${ACTOR_GPUS_OVERRIDE:-}"
+ROLLOUT_GPUS_OVERRIDE="${ROLLOUT_GPUS_OVERRIDE:-}"
 NUM_ROLLOUT_OVERRIDE="${NUM_ROLLOUT_OVERRIDE:-}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-}"
 ACTOR_CHECKPOINT="${ACTOR_CHECKPOINT:-${REF_LOAD:-}}"
@@ -36,8 +40,10 @@ Usage:
 
 Method:
   --model NAME                qwen3-1.7b, qwen3-4b, or qwen3.5-9b
-  --preset NAME               opsa, fixed-negative, or fixed-positive
+  --preset NAME               opsa, fixed-negative, fixed-positive, or topk
   --fraction FLOAT            Lowest-token fraction in (0, 1] (default: 0.2)
+  --top-k INTEGER             Top-K support for --preset topk (default: 10)
+  --topk-advantage FLOAT      Negative Top-K suppression advantage (default: -0.5)
   --steps INTEGER             Override the model preset's training steps
 
 Paths:
@@ -50,6 +56,8 @@ Paths:
   --megatron-path DIR         Megatron-LM checkout
 
 Runtime:
+  --actor-gpus INTEGER        Override actor GPU count from the model preset
+  --rollout-gpus INTEGER      Override rollout GPU count from the model preset
   --ray-address URL           Submit to an existing Ray dashboard
   --ray-port PORT             Local Ray GCS port (default: 6379)
   --dashboard-port PORT       Local Ray dashboard port (default: 8265)
@@ -115,6 +123,16 @@ while [ "$#" -gt 0 ]; do
          TOKEN_FRACTION="$2"
          shift 2
          ;;
+      --top-k)
+         require_value "$@"
+         TOP_K="$2"
+         shift 2
+         ;;
+      --topk-advantage)
+         require_value "$@"
+         TOPK_ADVANTAGE="$2"
+         shift 2
+         ;;
       --steps)
          require_value "$@"
          NUM_ROLLOUT_OVERRIDE="$2"
@@ -153,6 +171,16 @@ while [ "$#" -gt 0 ]; do
       --megatron-path)
          require_value "$@"
          MEGATRON_PATH="$2"
+         shift 2
+         ;;
+      --actor-gpus)
+         require_value "$@"
+         ACTOR_GPUS_OVERRIDE="$2"
+         shift 2
+         ;;
+      --rollout-gpus)
+         require_value "$@"
+         ROLLOUT_GPUS_OVERRIDE="$2"
          shift 2
          ;;
       --ray-address)
@@ -227,9 +255,16 @@ case "$MODEL" in
 esac
 
 case "$PRESET" in
-   opsa|fixed-negative|fixed-positive) ;;
+   opsa|fixed-negative|fixed-positive|topk) ;;
    *) die "unsupported preset '$PRESET'" ;;
 esac
+
+if ! [[ "$TOP_K" =~ ^[1-9][0-9]*$ ]]; then
+   die "--top-k/TOP_K must be a positive integer"
+fi
+if [ "$PRESET" = topk ] && ! awk -v value="$TOPK_ADVANTAGE" 'BEGIN { exit !(value < 0) }'; then
+   die "--topk-advantage/TOPK_ADVANTAGE must be negative"
+fi
 
 if ! [[ "$TOKEN_FRACTION" =~ ^(0([.][0-9]+)?|1([.]0*)?)$ ]]; then
    die "--fraction must be a number in (0, 1]"
@@ -280,6 +315,12 @@ if [ ! -f "$MODEL_CONFIG" ]; then
    die "model definition not found: $MODEL_CONFIG"
 fi
 source "$MODEL_CONFIG"
+if [ -n "$ACTOR_GPUS_OVERRIDE" ]; then
+   ACTOR_GPUS="$ACTOR_GPUS_OVERRIDE"
+fi
+if [ -n "$ROLLOUT_GPUS_OVERRIDE" ]; then
+   ROLLOUT_GPUS="$ROLLOUT_GPUS_OVERRIDE"
+fi
 if [ -n "$NUM_ROLLOUT_OVERRIDE" ]; then
    NUM_ROLLOUT="$NUM_ROLLOUT_OVERRIDE"
 fi
@@ -366,6 +407,13 @@ case "$PRESET" in
          --opsa-mode fixed
          --opsa-token-fraction "$TOKEN_FRACTION"
          --opsa-fixed-advantage 0.2
+      )
+      ;;
+   topk)
+      OPSA_ARGS=(
+         --opsa-mode topk
+         --opsa-top-k "$TOP_K"
+         --opsa-fixed-advantage "$TOPK_ADVANTAGE"
       )
       ;;
 esac
@@ -458,9 +506,13 @@ SGLANG_ARGS=(
 
 WANDB_ARGS=()
 if [ -n "$WANDB_PROJECT" ]; then
-   fraction_percentage="$(awk -v value="$TOKEN_FRACTION" 'BEGIN { printf "%g", value * 100 }')"
-   fraction_percentage="${fraction_percentage//./p}"
-   WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-${PRESET}-lowest${fraction_percentage}}"
+   if [ "$PRESET" = topk ]; then
+      WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-topk${TOP_K}}"
+   else
+      fraction_percentage="$(awk -v value="$TOKEN_FRACTION" 'BEGIN { printf "%g", value * 100 }')"
+      fraction_percentage="${fraction_percentage//./p}"
+      WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-${PRESET}-lowest${fraction_percentage}}"
+   fi
    WANDB_ARGS=(
       --use-wandb
       --wandb-project "$WANDB_PROJECT"
@@ -525,7 +577,11 @@ RUNTIME_ENV_JSON="$(
 
 echo "Model:               $MODEL_DISPLAY_NAME"
 echo "Preset:              $PRESET"
-echo "Lowest fraction:     $TOKEN_FRACTION"
+if [ "$PRESET" = topk ]; then
+   echo "Top-K suppression:   K=${TOP_K}, advantage=${TOPK_ADVANTAGE}"
+else
+   echo "Lowest fraction:     $TOKEN_FRACTION"
+fi
 echo "Actor/Rollout GPUs:  ${ACTOR_GPUS}/${ROLLOUT_GPUS}"
 echo "Training TP:         $TENSOR_MODEL_PARALLEL_SIZE"
 echo "Training steps:      $NUM_ROLLOUT"

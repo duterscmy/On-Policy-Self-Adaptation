@@ -391,6 +391,92 @@ def _extract_per_sample(
     return log_probs_list, entropy_list
 
 
+def _compute_topk_violation_masks(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    max_seq_lens: list[int] | None,
+) -> list[torch.Tensor]:
+    """Mark sampled response tokens whose global actor rank is larger than K.
+
+    Megatron vocabulary logits are tensor-parallel shards. For each sampled
+    response token, recover its target logit across TP ranks, count how many
+    global vocabulary logits are strictly larger, and mark a violation when
+    that count is at least K (equivalently, rank > K).
+
+    This is evaluated only during the no-grad current-actor log-probability
+    forward used to build OPSA advantages. The vocabulary comparison is
+    row-chunked to limit temporary memory.
+    """
+    if mpu.get_context_parallel_world_size() != 1:
+        raise ValueError("Top-K OPSA currently requires context parallel size 1.")
+
+    top_k = args.opsa_top_k
+    if top_k <= 0:
+        raise ValueError(f"--opsa-top-k must be positive, got {top_k}.")
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_world_size = mpu.get_tensor_model_parallel_world_size()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    configured_chunk = int(getattr(args, "log_probs_chunk_size", -1))
+    row_chunk_size = configured_chunk if configured_chunk > 0 else 512
+
+    violation_masks: list[torch.Tensor] = []
+    with torch.no_grad():
+        for logits_chunk, tokens_chunk in get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+        ):
+            if logits_chunk.numel() == 0:
+                violation_masks.append(
+                    torch.zeros(tokens_chunk.shape, dtype=torch.float32, device=tokens_chunk.device)
+                )
+                continue
+
+            local_vocab_size = logits_chunk.size(-1)
+            vocab_start = tp_rank * local_vocab_size
+            vocab_end = vocab_start + local_vocab_size
+            sample_parts: list[torch.Tensor] = []
+
+            for start in range(0, logits_chunk.size(0), row_chunk_size):
+                end = min(start + row_chunk_size, logits_chunk.size(0))
+                rows = logits_chunk[start:end]
+                targets = tokens_chunk[start:end]
+
+                local_target = targets - vocab_start
+                owns_target = (targets >= vocab_start) & (targets < vocab_end)
+                target_logits = torch.full(
+                    (end - start,),
+                    -torch.inf,
+                    dtype=rows.dtype,
+                    device=rows.device,
+                )
+                if owns_target.any():
+                    owned_rows = torch.nonzero(owns_target, as_tuple=False).flatten()
+                    target_logits[owned_rows] = rows[owned_rows, local_target[owned_rows]]
+
+                if tp_world_size > 1:
+                    dist.all_reduce(target_logits, op=dist.ReduceOp.MAX, group=tp_group)
+
+                better_count = (rows > target_logits.unsqueeze(-1)).sum(dim=-1, dtype=torch.int32)
+                if tp_world_size > 1:
+                    dist.all_reduce(better_count, op=dist.ReduceOp.SUM, group=tp_group)
+
+                # rank = 1 + number of logits strictly greater than sampled token.
+                sample_parts.append((better_count >= top_k).to(dtype=torch.float32))
+
+            violation_masks.append(torch.cat(sample_parts, dim=0))
+
+    return violation_masks
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -416,6 +502,21 @@ def get_log_probs_and_entropy(
 
     assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
+
+    topk_violation_masks = None
+    if (
+        args.advantage_estimator == "opsa"
+        and args.opsa_mode == "topk"
+        and not torch.is_grad_enabled()
+    ):
+        topk_violation_masks = _compute_topk_violation_masks(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+        )
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -464,6 +565,8 @@ def get_log_probs_and_entropy(
     res = {"log_probs": log_probs_list}
     if with_entropy:
         res["entropy"] = entropy_list
+    if topk_violation_masks is not None:
+        res["opsa_topk_violation_mask"] = topk_violation_masks
 
     # we need to turn the all gather kv into zigzag ring attn kv
     if args.allgather_cp:
@@ -556,6 +659,53 @@ def _compute_opsa_for_rollout(
         raise ValueError("OPSA entropy mode requires actor entropy from the log-prob forward pass.")
 
     cp_size = mpu.get_context_parallel_world_size()
+    if args.opsa_mode == "topk":
+        violation_masks = rollout_data.get("opsa_topk_violation_mask")
+        if violation_masks is None:
+            raise ValueError(
+                "Top-K OPSA requires opsa_topk_violation_mask from the current-actor log-prob forward."
+            )
+        if cp_size != 1:
+            raise ValueError("Top-K OPSA currently requires context parallel size 1.")
+        if len(violation_masks) != len(student_log_probs):
+            raise ValueError("Top-K violation-mask count does not match actor log-prob count.")
+
+        advantages = []
+        topk_loss_masks = []
+        for log_prob, loss_mask, violation_mask in zip(
+            student_log_probs, loss_masks, violation_masks, strict=True
+        ):
+            if log_prob.shape != loss_mask.shape or log_prob.shape != violation_mask.shape:
+                raise ValueError(
+                    "Top-K OPSA tensors must have matching response shapes: "
+                    f"log_prob={tuple(log_prob.shape)}, loss_mask={tuple(loss_mask.shape)}, "
+                    f"violation_mask={tuple(violation_mask.shape)}."
+                )
+            selected = loss_mask.bool() & violation_mask.bool()
+            advantage = torch.zeros_like(log_prob)
+            advantage[selected] = args.opsa_fixed_advantage
+            advantages.append(advantage)
+            topk_loss_masks.append(selected.to(dtype=loss_mask.dtype))
+
+        selected_tokens = sum(mask.float().sum() for mask in topk_loss_masks)
+        valid_tokens = sum(mask.float().sum() for mask in loss_masks)
+        device = student_log_probs[0].device
+        rollout_data["opsa_loss_mask"] = topk_loss_masks
+        rollout_data["opsa/selected_fraction"] = (
+            selected_tokens / torch.clamp_min(valid_tokens, 1.0)
+        ).detach()
+        rollout_data["opsa/selected_tokens"] = selected_tokens.detach()
+        rollout_data["opsa/valid_tokens"] = valid_tokens.detach()
+        rollout_data["opsa/advantage_mean"] = torch.where(
+            selected_tokens > 0,
+            torch.tensor(float(args.opsa_fixed_advantage), device=device),
+            torch.zeros((), dtype=torch.float32, device=device),
+        ).detach()
+        rollout_data["opsa/top_k"] = torch.tensor(
+            float(args.opsa_top_k), dtype=torch.float32, device=device
+        )
+        return advantages, [advantage.clone() for advantage in advantages]
+
     if cp_size > 1:
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)

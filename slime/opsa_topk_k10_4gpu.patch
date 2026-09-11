@@ -1,0 +1,673 @@
+diff --git a/slime/slime/utils/arguments.py b/slime/slime/utils/arguments.py
+--- a/slime/slime/utils/arguments.py
++++ b/slime/slime/utils/arguments.py
+@@ -914,15 +914,24 @@
+             parser.add_argument(
+                 "--opsa-mode",
+                 type=str,
+-                choices=["entropy", "fixed"],
++                choices=["entropy", "fixed", "topk"],
+                 default="entropy",
+-                help="Assign entropy-ranked or fixed advantages to selected lowest-logp tokens.",
++                help=(
++                    "OPSA token-selection mode: entropy/fixed select the lowest-logp "
++                    "fraction; topk suppresses sampled tokens outside the actor's Top-K."
++                ),
+             )
+             parser.add_argument(
+                 "--opsa-token-fraction",
+                 type=float,
+                 default=0.2,
+                 help="Fraction of valid response tokens selected by lowest actor log-probability.",
++            )
++            parser.add_argument(
++                "--opsa-top-k",
++                type=int,
++                default=20,
++                help="For --opsa-mode=topk, suppress a sampled token when its actor rank is greater than K.",
+             )
+             parser.add_argument(
+                 "--opsa-advantage-min",
+@@ -940,5 +949,5 @@
+                 "--opsa-fixed-advantage",
+                 type=float,
+                 default=None,
+-                help="Non-zero advantage required by --opsa-mode=fixed.",
++                help="Fixed advantage used by --opsa-mode=fixed or --opsa-mode=topk.",
+             )
+diff --git a/slime/slime/utils/wandb_utils.py b/slime/slime/utils/wandb_utils.py
+--- a/slime/slime/utils/wandb_utils.py
++++ b/slime/slime/utils/wandb_utils.py
+@@ -13,6 +13,7 @@
+     "advantage_estimator",
+     "opsa_mode",
+     "opsa_token_fraction",
++    "opsa_top_k",
+     "opsa_advantage_min",
+     "opsa_advantage_max",
+     "opsa_fixed_advantage",
+diff --git a/slime/slime/backends/megatron_utils/opsa.py b/slime/slime/backends/megatron_utils/opsa.py
+--- a/slime/slime/backends/megatron_utils/opsa.py
++++ b/slime/slime/backends/megatron_utils/opsa.py
+@@ -30,12 +30,12 @@
+     if args.kl_coef != 0 or args.use_kl_loss:
+         raise ValueError("OPSA is reference-free; --kl-coef must be 0 and --use-kl-loss must be disabled.")
+-    if not 0 < args.opsa_token_fraction <= 1:
++    if args.opsa_mode in {"entropy", "fixed"} and not 0 < args.opsa_token_fraction <= 1:
+         raise ValueError("--opsa-token-fraction must be in (0, 1].")
+-    if not args.opsa_advantage_min < args.opsa_advantage_max < 0:
+-        raise ValueError("--opsa-advantage-min/max must satisfy min < max < 0.")
+     if args.opsa_mode == "entropy":
++        if not args.opsa_advantage_min < args.opsa_advantage_max < 0:
++            raise ValueError("--opsa-advantage-min/max must satisfy min < max < 0.")
+         if args.opsa_fixed_advantage is not None:
+-            raise ValueError("--opsa-fixed-advantage is only valid with --opsa-mode=fixed.")
++            raise ValueError("--opsa-fixed-advantage is only valid with --opsa-mode=fixed or topk.")
+         args.use_rollout_entropy = True
+     elif args.opsa_mode == "fixed":
+         if args.entropy_coef != 0:
+@@ -45,6 +45,16 @@
+         if args.use_rollout_entropy:
+             raise ValueError("--opsa-mode=fixed does not compute entropy; remove --use-rollout-entropy.")
+         args.use_rollout_entropy = False
++    elif args.opsa_mode == "topk":
++        if args.entropy_coef != 0:
++            raise ValueError("--opsa-mode=topk requires --entropy-coef=0 so entropy is not computed.")
++        if args.opsa_top_k <= 0:
++            raise ValueError("--opsa-top-k must be a positive integer.")
++        if args.opsa_fixed_advantage is None or args.opsa_fixed_advantage >= 0:
++            raise ValueError("--opsa-mode=topk requires a negative --opsa-fixed-advantage.")
++        if args.use_rollout_entropy:
++            raise ValueError("--opsa-mode=topk does not compute entropy; remove --use-rollout-entropy.")
++        args.use_rollout_entropy = False
+     else:
+         raise ValueError(f"Unsupported OPSA mode: {args.opsa_mode!r}.")
+ 
+@@ -60,6 +70,7 @@
+     log_probs: list[torch.Tensor],
+     loss_masks: list[torch.Tensor],
+     entropies: list[torch.Tensor] | None,
++    topk_outside_masks: list[torch.Tensor] | None,
+ ) -> None:
+     if len(log_probs) != len(loss_masks):
+         raise ValueError(
+@@ -68,6 +79,11 @@
+     if entropies is not None and len(entropies) != len(log_probs):
+         raise ValueError(
+             f"OPSA expected one entropy tensor per log-prob tensor, got {len(entropies)} entropy tensors for {len(log_probs)} log-prob tensors."
++        )
++    if topk_outside_masks is not None and len(topk_outside_masks) != len(log_probs):
++        raise ValueError(
++            "OPSA expected one Top-K mask per log-prob tensor, "
++            f"got {len(topk_outside_masks)} masks for {len(log_probs)} log-prob tensors."
+         )
+     for index, (log_prob, loss_mask) in enumerate(zip(log_probs, loss_masks, strict=True)):
+         if log_prob.shape != loss_mask.shape:
+@@ -78,6 +94,11 @@
+             raise ValueError(
+                 f"OPSA entropy/log-prob shape mismatch for sample {index}: {tuple(entropies[index].shape)} vs {tuple(log_prob.shape)}."
+             )
++        if topk_outside_masks is not None and topk_outside_masks[index].shape != log_prob.shape:
++            raise ValueError(
++                "OPSA Top-K-mask/log-prob shape mismatch for sample "
++                f"{index}: {tuple(topk_outside_masks[index].shape)} vs {tuple(log_prob.shape)}."
++            )
+ 
+ 
+ def compute_opsa(
+@@ -87,20 +108,22 @@
+     token_fraction: float,
+     mode: str,
+     entropies: list[torch.Tensor] | None = None,
++    topk_outside_masks: list[torch.Tensor] | None = None,
+     advantage_min: float = -1.0,
+     advantage_max: float = -0.5,
+     fixed_advantage: float | None = None,
+ ) -> OPSAOutput:
+-    """Compute OPSA advantages for a DP-local packed response batch.
+-    Valid response tokens from every sample in ``log_probs`` are concatenated
+-    conceptually.  The lowest ``floor(token_fraction * N)`` actor log-probability
+-    tokens are selected, with at least one token selected whenever ``N > 0``.
+-    Unselected tokens receive zero advantage and a zero loss mask.
++    """Compute OPSA-style advantages for a DP-local packed response batch.
++
++    ``entropy`` and ``fixed`` preserve the original lowest-logp selection.
++    ``topk`` instead selects every valid sampled token whose actor rank is
++    greater than K, as precomputed by ``topk_outside_masks``. Unselected tokens
++    receive zero advantage and a zero loss mask.
+     """
+-    if not 0 < token_fraction <= 1:
++    if mode not in {"entropy", "fixed", "topk"}:
++        raise ValueError(f"OPSA mode must be 'entropy', 'fixed', or 'topk', got {mode!r}.")
++    if mode in {"entropy", "fixed"} and not 0 < token_fraction <= 1:
+         raise ValueError(f"OPSA token_fraction must be in (0, 1], got {token_fraction}.")
+-    if mode not in {"entropy", "fixed"}:
+-        raise ValueError(f"OPSA mode must be 'entropy' or 'fixed', got {mode!r}.")
+     if mode == "entropy":
+         if entropies is None:
+             raise ValueError("OPSA entropy mode requires actor entropies.")
+@@ -108,9 +131,15 @@
+             raise ValueError(
+                 f"OPSA entropy advantages must satisfy advantage_min < advantage_max < 0, got {advantage_min} and {advantage_max}."
+             )
+-    elif fixed_advantage is None or fixed_advantage == 0:
+-        raise ValueError("OPSA fixed mode requires a non-zero fixed_advantage.")
+-    _validate_inputs(log_probs, loss_masks, entropies)
++    elif mode == "fixed":
++        if fixed_advantage is None or fixed_advantage == 0:
++            raise ValueError("OPSA fixed mode requires a non-zero fixed_advantage.")
++    else:
++        if topk_outside_masks is None:
++            raise ValueError("OPSA topk mode requires topk_outside_masks.")
++        if fixed_advantage is None or fixed_advantage >= 0:
++            raise ValueError("OPSA topk mode requires a negative fixed_advantage.")
++    _validate_inputs(log_probs, loss_masks, entropies, topk_outside_masks)
+ 
+     if not log_probs:
+         empty = torch.tensor(0.0)
+@@ -131,7 +160,16 @@
+     flat_opsa_mask = torch.zeros_like(flat_log_probs, dtype=torch.float32)
+     valid_indices = torch.nonzero(flat_valid_mask, as_tuple=False).flatten()
+     valid_count = valid_indices.numel()
+-    if valid_count > 0:
++    if mode == "topk":
++        flat_topk_outside = torch.cat(
++            [value.detach().to(device=device).bool() for value in topk_outside_masks]
++        )
++        selected_indices = torch.nonzero(flat_valid_mask & flat_topk_outside, as_tuple=False).flatten()
++        selected_count = selected_indices.numel()
++        if selected_count > 0:
++            flat_opsa_mask[selected_indices] = 1.0
++            flat_advantages[selected_indices] = fixed_advantage
++    elif valid_count > 0:
+         selected_count = max(1, math.floor(token_fraction * valid_count))
+         selected_count = min(selected_count, valid_count)
+         order = torch.argsort(flat_log_probs[valid_indices], stable=True)
+diff --git a/slime/slime/backends/megatron_utils/loss.py b/slime/slime/backends/megatron_utils/loss.py
+--- a/slime/slime/backends/megatron_utils/loss.py
++++ b/slime/slime/backends/megatron_utils/loss.py
+@@ -354,4 +354,59 @@
+     return log_probs_list, entropy_list
++
++
++@torch.no_grad()
++def _compute_topk_outside_mask(
++    logits: torch.Tensor,
++    target_tokens: torch.Tensor,
++    *,
++    top_k: int,
++    vocab_size: int | None,
++    tp_group,
++) -> torch.Tensor:
++    """Return 1 where the sampled target is outside the actor's global Top-K.
++
++    The vocabulary is tensor-parallel sharded. We only inspect each shard's
++    local Top-K values, which is sufficient to determine whether at least K
++    vocabulary logits are strictly larger than the sampled token logit.
++    """
++    if top_k <= 0:
++        raise ValueError(f"top_k must be positive, got {top_k}.")
++
++    tp_size = mpu.get_tensor_model_parallel_world_size()
++    tp_rank = mpu.get_tensor_model_parallel_rank()
++    local_vocab_size = logits.size(-1)
++    padded_vocab_size = local_vocab_size * tp_size
++    effective_vocab_size = int(vocab_size or padded_vocab_size)
++    effective_vocab_size = min(effective_vocab_size, padded_vocab_size)
++
++    if top_k >= effective_vocab_size:
++        return torch.zeros(target_tokens.shape, dtype=torch.float32, device=logits.device)
++
++    vocab_start = tp_rank * local_vocab_size
++    valid_local_vocab = max(0, min(local_vocab_size, effective_vocab_size - vocab_start))
++
++    target_is_local = (target_tokens >= vocab_start) & (target_tokens < vocab_start + valid_local_vocab)
++    local_target_logits = torch.zeros(target_tokens.shape, dtype=logits.dtype, device=logits.device)
++    if valid_local_vocab > 0 and target_is_local.any():
++        local_target_ids = target_tokens[target_is_local] - vocab_start
++        local_target_logits[target_is_local] = logits[target_is_local, local_target_ids]
++
++    if tp_size > 1:
++        dist.all_reduce(local_target_logits, op=dist.ReduceOp.SUM, group=tp_group)
++
++    if valid_local_vocab > 0:
++        local_k = min(top_k, valid_local_vocab)
++        local_topk_values = torch.topk(logits[:, :valid_local_vocab], k=local_k, dim=-1, sorted=False).values
++        local_num_greater = (local_topk_values > local_target_logits.unsqueeze(-1)).sum(dim=-1, dtype=torch.int32)
++    else:
++        local_num_greater = torch.zeros(target_tokens.shape, dtype=torch.int32, device=logits.device)
++
++    if tp_size > 1:
++        dist.all_reduce(local_num_greater, op=dist.ReduceOp.SUM, group=tp_group)
++
++    # Strictly more than K is unnecessary: if K or more tokens have larger
++    # logits, the sampled token's 1-indexed rank is > K.
++    return (local_num_greater >= top_k).to(dtype=torch.float32)
+ 
+ 
+ def get_log_probs_and_entropy(
+@@ -362,6 +417,7 @@
+     total_lengths: list[int],
+     response_lengths: list[int],
+     with_entropy: bool = False,
++    with_topk_mask: bool = False,
+     non_loss_data: bool = True,
+     max_seq_lens: list[int] | None = None,
+ ) -> dict[str, list[torch.Tensor]]:
+@@ -397,5 +453,14 @@
+     full_tokens = _build_shifted_tokens(
+         T, device, unconcat_tokens, total_lengths, response_lengths, qkv_format, max_seq_lens, args.allgather_cp
+     )
++    topk_outside_full = None
++    if with_topk_mask:
++        topk_outside_full = _compute_topk_outside_mask(
++            logits,
++            full_tokens,
++            top_k=args.opsa_top_k,
++            vocab_size=getattr(args, "vocab_size", None),
++            tp_group=tp_group,
++        )
+     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
+     log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+@@ -421,4 +486,16 @@
+     res = {"log_probs": log_probs_list}
+     if with_entropy:
+         res["entropy"] = entropy_list
++    if topk_outside_full is not None:
++        topk_outside_list, _ = _extract_per_sample(
++            topk_outside_full,
++            None,
++            unconcat_tokens,
++            total_lengths,
++            response_lengths,
++            qkv_format,
++            max_seq_lens,
++            args.allgather_cp,
++        )
++        res["topk_outside_mask"] = topk_outside_list
+     # we need to turn the all gather kv into zigzag ring attn kv
+@@ -443,5 +520,6 @@
+     response_lengths: list[int],
+     with_entropy: bool = False,
++    with_topk_mask: bool = False,
+     non_loss_data: bool = True,
+     max_seq_lens: list[int] | None = None,
+ ) -> dict[str, list[torch.Tensor]]:
+@@ -503,6 +581,9 @@
+     entropies = rollout_data.get("entropy")
++    topk_outside_masks = rollout_data.get("topk_outside_mask")
+     if args.opsa_mode == "entropy" and entropies is None:
+         raise ValueError("OPSA entropy mode requires actor entropy from the log-prob forward pass.")
++    if args.opsa_mode == "topk" and topk_outside_masks is None:
++        raise ValueError("OPSA topk mode requires actor Top-K membership from the log-prob forward pass.")
+     cp_size = mpu.get_context_parallel_world_size()
+     if cp_size > 1:
+         full_log_probs = [
+@@ -519,15 +600,25 @@
+                     entropies, total_lengths, response_lengths, strict=True
+                 )
+             ]
++        full_topk_outside_masks = None
++        if topk_outside_masks is not None:
++            full_topk_outside_masks = [
++                all_gather_with_cp(mask, total_length, response_length)
++                for mask, total_length, response_length in zip(
++                    topk_outside_masks, total_lengths, response_lengths, strict=True
++                )
++            ]
+     else:
+         full_log_probs = student_log_probs
+         full_entropies = entropies
++        full_topk_outside_masks = topk_outside_masks
+     output = compute_opsa(
+         full_log_probs,
+         loss_masks,
+         token_fraction=args.opsa_token_fraction,
+         mode=args.opsa_mode,
+         entropies=full_entropies,
++        topk_outside_masks=full_topk_outside_masks,
+         advantage_min=args.opsa_advantage_min,
+         advantage_max=args.opsa_advantage_max,
+         fixed_advantage=args.opsa_fixed_advantage,
+@@ -745,3 +836,3 @@
+     # Standard Slime keeps entropy metrics for its original estimators. OPSA
+-    # fixed mode never computes entropy; validation also requires entropy_coef=0.
++    # fixed/topk modes never compute entropy; validation also requires entropy_coef=0.
+     with_entropy = args.advantage_estimator != "opsa" or args.opsa_mode == "entropy"
+diff --git a/slime/slime/backends/megatron_utils/model.py b/slime/slime/backends/megatron_utils/model.py
+--- a/slime/slime/backends/megatron_utils/model.py
++++ b/slime/slime/backends/megatron_utils/model.py
+@@ -225,5 +225,10 @@
+             total_lengths=total_lengths,
+             response_lengths=response_lengths,
+             with_entropy=args.use_rollout_entropy,
++            with_topk_mask=(
++                args.advantage_estimator == "opsa"
++                and args.opsa_mode == "topk"
++                and store_prefix == ""
++            ),
+             max_seq_lens=batch.get("max_seq_lens", None),
+         )
+diff --git a/slime/examples/opsa/run_opsa.sh b/slime/examples/opsa/run_opsa.sh
+--- a/slime/examples/opsa/run_opsa.sh
++++ b/slime/examples/opsa/run_opsa.sh
+@@ -6,6 +6,8 @@
+ MODEL="qwen3-1.7b"
+ PRESET="opsa"
+ TOKEN_FRACTION="0.2"
++TOP_K="${TOP_K:-10}"
++TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
+ NUM_ROLLOUT_OVERRIDE="${NUM_ROLLOUT_OVERRIDE:-}"
+ HF_CHECKPOINT="${HF_CHECKPOINT:-}"
+ ACTOR_CHECKPOINT="${ACTOR_CHECKPOINT:-${REF_LOAD:-}}"
+@@ -33,8 +35,10 @@
+ 
+ Method:
+   --model NAME                qwen3-1.7b, qwen3-4b, or qwen3.5-9b
+-  --preset NAME               opsa, fixed-negative, or fixed-positive
++  --preset NAME               opsa, fixed-negative, fixed-positive, or topk
+   --fraction FLOAT            Lowest-token fraction in (0, 1] (default: 0.2)
++  --top-k INTEGER             For preset=topk, keep sampled Top-K tokens and suppress the rest
++  --topk-advantage FLOAT      Negative advantage for outside-Top-K tokens (default: -0.5)
+   --steps INTEGER             Override the model preset's training steps
+ Paths:
+   --hf-checkpoint PATH        Hugging Face checkpoint used by rollout
+@@ -106,6 +110,16 @@
+          TOKEN_FRACTION="$2"
+          shift 2
+          ;;
++      --top-k)
++         require_value "$@"
++         TOP_K="$2"
++         shift 2
++         ;;
++      --topk-advantage)
++         require_value "$@"
++         TOPK_ADVANTAGE="$2"
++         shift 2
++         ;;
+       --steps)
+          require_value "$@"
+          NUM_ROLLOUT_OVERRIDE="$2"
+@@ -217,7 +231,7 @@
+ esac
+ 
+ case "$PRESET" in
+-   opsa|fixed-negative|fixed-positive) ;;
++   opsa|fixed-negative|fixed-positive|topk) ;;
+    *) die "unsupported preset '$PRESET'" ;;
+ esac
+ if ! [[ "$TOKEN_FRACTION" =~ ^(0([.][0-9]+)?|1([.]0*)?)$ ]]; then
+@@ -226,6 +240,14 @@
+ if ! awk -v fraction="$TOKEN_FRACTION" 'BEGIN { exit !(fraction > 0 && fraction <= 1) }'; then
+    die "--fraction must be a number in (0, 1]"
+ fi
++if [ "$PRESET" = topk ]; then
++   if ! [[ "$TOP_K" =~ ^[1-9][0-9]*$ ]]; then
++      die "--top-k must be a positive integer"
++   fi
++   if ! awk -v advantage="$TOPK_ADVANTAGE" 'BEGIN { exit !(advantage < 0) }'; then
++      die "--topk-advantage must be negative"
++   fi
++fi
+ if [ -n "$NUM_ROLLOUT_OVERRIDE" ] && ! [[ "$NUM_ROLLOUT_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
+    die "--steps/NUM_ROLLOUT_OVERRIDE must be a positive integer"
+ fi
+@@ -348,6 +370,13 @@
+          --opsa-fixed-advantage 0.2
+       )
+       ;;
++   topk)
++      OPSA_ARGS=(
++         --opsa-mode topk
++         --opsa-top-k "$TOP_K"
++         --opsa-fixed-advantage "$TOPK_ADVANTAGE"
++      )
++      ;;
+ esac
+ CKPT_ARGS=(
+    --hf-checkpoint "$HF_CHECKPOINT"
+@@ -432,9 +461,15 @@
+ )
+ WANDB_ARGS=()
+ if [ -n "$WANDB_PROJECT" ]; then
+-   fraction_percentage="$(awk -v value="$TOKEN_FRACTION" 'BEGIN { printf "%g", value * 100 }')"
+-   fraction_percentage="${fraction_percentage//./p}"
+-   WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-${PRESET}-lowest${fraction_percentage}}"
++   if [ "$PRESET" = topk ]; then
++      advantage_tag="${TOPK_ADVANTAGE//-/m}"
++      advantage_tag="${advantage_tag//./p}"
++      WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-topk-k${TOP_K}-adv${advantage_tag}}"
++   else
++      fraction_percentage="$(awk -v value="$TOKEN_FRACTION" 'BEGIN { printf "%g", value * 100 }')"
++      fraction_percentage="${fraction_percentage//./p}"
++      WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-${PRESET}-lowest${fraction_percentage}}"
++   fi
+    WANDB_ARGS=(
+       --use-wandb
+       --wandb-project "$WANDB_PROJECT"
+@@ -494,7 +529,11 @@
+ )"
+ echo "Model:               $MODEL_DISPLAY_NAME"
+ echo "Preset:              $PRESET"
+-echo "Lowest fraction:     $TOKEN_FRACTION"
++if [ "$PRESET" = topk ]; then
++   echo "Top-K / advantage:   ${TOP_K} / ${TOPK_ADVANTAGE}"
++else
++   echo "Lowest fraction:     $TOKEN_FRACTION"
++fi
+ echo "Actor/Rollout GPUs:  ${ACTOR_GPUS}/${ROLLOUT_GPUS}"
+ echo "Training TP:         $TENSOR_MODEL_PARALLEL_SIZE"
+ echo "Training steps:      $NUM_ROLLOUT"
+diff --git a/slime/tests/test_opsa_topk.py b/slime/tests/test_opsa_topk.py
+new file mode 100644
+--- /dev/null
++++ b/slime/tests/test_opsa_topk.py
+@@ -0,0 +1,77 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from slime.backends.megatron_utils.opsa import compute_opsa, validate_opsa_args
++
++
++def _args(**overrides):
++    values = {
++        "advantage_estimator": "opsa",
++        "use_opd": False,
++        "normalize_advantages": False,
++        "use_rollout_logprobs": False,
++        "use_rollout_entropy": False,
++        "kl_coef": 0.0,
++        "use_kl_loss": False,
++        "entropy_coef": 0.0,
++        "opsa_token_fraction": 0.2,
++        "opsa_advantage_min": -1.0,
++        "opsa_advantage_max": -0.5,
++        "opsa_mode": "topk",
++        "opsa_fixed_advantage": -0.5,
++        "opsa_top_k": 10,
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def test_topk_mode_selects_only_valid_tokens_outside_topk():
++    output = compute_opsa(
++        [torch.tensor([-3.0, -2.0, -1.0, -0.5])],
++        [torch.tensor([1.0, 1.0, 0.0, 1.0])],
++        token_fraction=0.2,
++        mode="topk",
++        topk_outside_masks=[torch.tensor([0.0, 1.0, 1.0, 1.0])],
++        fixed_advantage=-0.5,
++    )
++
++    assert torch.equal(output.loss_masks[0], torch.tensor([0.0, 1.0, 0.0, 1.0]))
++    assert torch.equal(output.advantages[0], torch.tensor([0.0, -0.5, 0.0, -0.5]))
++    assert output.metrics["opsa/selected_fraction"].item() == pytest.approx(2 / 3)
++
++
++def test_topk_mode_can_select_nothing():
++    output = compute_opsa(
++        [torch.tensor([-3.0, -2.0])],
++        [torch.ones(2)],
++        token_fraction=0.2,
++        mode="topk",
++        topk_outside_masks=[torch.zeros(2)],
++        fixed_advantage=-0.5,
++    )
++
++    assert torch.equal(output.loss_masks[0], torch.zeros(2))
++    assert torch.equal(output.advantages[0], torch.zeros(2))
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"opsa_top_k": 0},
++        {"opsa_fixed_advantage": 0.0},
++        {"opsa_fixed_advantage": 0.2},
++        {"entropy_coef": 0.01},
++        {"use_rollout_entropy": True},
++    ],
++)
++def test_topk_mode_rejects_invalid_configuration(overrides):
++    with pytest.raises(ValueError):
++        validate_opsa_args(_args(**overrides))
++
++
++def test_topk_mode_disables_entropy():
++    args = _args()
++    validate_opsa_args(args)
++    assert args.use_rollout_entropy is False
+diff --git a/slime/examples/opsa/run_topk_sweep.sh b/slime/examples/opsa/run_topk_sweep.sh
+new file mode 100755
+--- /dev/null
++++ b/slime/examples/opsa/run_topk_sweep.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
++MODEL="${MODEL:-qwen3-1.7b}"
++TOPK_VALUES="${TOPK_VALUES:-1 5 10 20 50}"
++TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
++OUTPUT_ROOT="${OUTPUT_ROOT:?Set OUTPUT_ROOT to the directory that should contain the Top-K runs.}"
++
++for K in ${TOPK_VALUES}; do
++   echo "=== Top-K suppression: K=${K}, advantage=${TOPK_ADVANTAGE} ==="
++   SAVE_DIR="${OUTPUT_ROOT}/topk-k${K}" \
++   bash "${SCRIPT_DIR}/run_opsa.sh" \
++      --model "${MODEL}" \
++      --preset topk \
++      --top-k "${K}" \
++      --topk-advantage "${TOPK_ADVANTAGE}" \
++      "$@"
++done
+diff --git a/slime/examples/opsa/models/qwen3-1.7b.sh b/slime/examples/opsa/models/qwen3-1.7b.sh
+--- a/slime/examples/opsa/models/qwen3-1.7b.sh
++++ b/slime/examples/opsa/models/qwen3-1.7b.sh
+@@ -2,7 +2,9 @@ MODEL_DISPLAY_NAME="Qwen3-1.7B"
+ MODEL_CONFIG_RELATIVE="scripts/models/qwen3-1.7B.sh"
+ NUM_ROLLOUT=700
+-ACTOR_GPUS=4
+-ROLLOUT_GPUS=4
++# Controlled 4-GPU default: 2 GPUs for actor training + 2 GPUs for rollout.
++# Override with ACTOR_GPUS=4 ROLLOUT_GPUS=4 to recover the canonical 8-GPU layout.
++ACTOR_GPUS="${ACTOR_GPUS:-2}"
++ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+ TENSOR_MODEL_PARALLEL_SIZE=1
+ ROLLOUT_GPUS_PER_ENGINE=1
+ ROLLOUT_MAX_RESPONSE_LEN=12000
+diff --git a/slime/examples/opsa/models/qwen3-4b.sh b/slime/examples/opsa/models/qwen3-4b.sh
+--- a/slime/examples/opsa/models/qwen3-4b.sh
++++ b/slime/examples/opsa/models/qwen3-4b.sh
+@@ -2,7 +2,9 @@ MODEL_DISPLAY_NAME="Qwen3-4B Base"
+ MODEL_CONFIG_RELATIVE="scripts/models/qwen3-4B.sh"
+ NUM_ROLLOUT=1000
+-ACTOR_GPUS=4
+-ROLLOUT_GPUS=4
++# Controlled 4-GPU default: 2 GPUs for actor training + 2 GPUs for rollout.
++# Override with ACTOR_GPUS=4 ROLLOUT_GPUS=4 to recover the canonical 8-GPU layout.
++ACTOR_GPUS="${ACTOR_GPUS:-2}"
++ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+ TENSOR_MODEL_PARALLEL_SIZE=2
+ ROLLOUT_GPUS_PER_ENGINE=2
+ ROLLOUT_MAX_RESPONSE_LEN=12000
+diff --git a/slime/examples/opsa/run_k10_vs_opsa_4gpu.sh b/slime/examples/opsa/run_k10_vs_opsa_4gpu.sh
+new file mode 100755
+--- /dev/null
++++ b/slime/examples/opsa/run_k10_vs_opsa_4gpu.sh
+@@ -0,0 +1,71 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Run the two main controlled experiments sequentially on the same 4-GPU layout:
++#   1) official OPSA selection: lowest 20% actor-logprob tokens + entropy-adaptive negative advantage
++#   2) proposed Top-K suppression: sampled-token rank > K, fixed negative advantage
++#
++# Defaults are chosen from the Top-K violation analysis:
++#   K=10, fixed advantage=-0.5.
++#
++# Required environment variables are the same as run_opsa.sh, plus OUTPUT_ROOT.
++#
++# Example:
++#   export HF_CHECKPOINT=/path/to/Qwen3-1.7B
++#   export ACTOR_CHECKPOINT=/path/to/qwen3-1.7b-megatron
++#   export PROMPT_DATA=/path/to/dapo-math-17k.jsonl
++#   export EVAL_DATA=/path/to/aime-2024.jsonl
++#   export MEGATRON_PATH=/path/to/Megatron-LM
++#   export OUTPUT_ROOT=/path/to/outputs/qwen3-1.7b_k10
++#   bash examples/opsa/run_k10_vs_opsa_4gpu.sh
++#
++# MODEL can be qwen3-1.7b or qwen3-4b.
++# Any extra CLI arguments are forwarded to run_opsa.sh (e.g. --dry-run).
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++MODEL="${MODEL:-qwen3-1.7b}"
++TOP_K="${TOP_K:-10}"
++TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
++OPSA_FRACTION="${OPSA_FRACTION:-0.2}"
++OUTPUT_ROOT="${OUTPUT_ROOT:?Please set OUTPUT_ROOT}"
++
++mkdir -p "${OUTPUT_ROOT}"
++
++case "${MODEL}" in
++  qwen3-1.7b|qwen3-4b)
++    ;;
++  *)
++    echo "run_k10_vs_opsa_4gpu.sh currently supports qwen3-1.7b and qwen3-4b." >&2
++    exit 2
++    ;;
++esac
++
++echo "============================================================"
++echo "[1/2] OPSA baseline | model=${MODEL} | 4 GPUs (2 actor + 2 rollout)"
++echo "============================================================"
++ACTOR_GPUS=2 ROLLOUT_GPUS=2 \
++bash "${SCRIPT_DIR}/run_opsa.sh" \
++  --model "${MODEL}" \
++  --preset opsa \
++  --fraction "${OPSA_FRACTION}" \
++  --save-dir "${OUTPUT_ROOT}/opsa" \
++  "$@"
++
++echo "============================================================"
++echo "[2/2] Top-K suppression | model=${MODEL} | K=${TOP_K} | A=${TOPK_ADVANTAGE}"
++echo "      4 GPUs (2 actor + 2 rollout)"
++echo "============================================================"
++ACTOR_GPUS=2 ROLLOUT_GPUS=2 \
++bash "${SCRIPT_DIR}/run_opsa.sh" \
++  --model "${MODEL}" \
++  --preset topk \
++  --top-k "${TOP_K}" \
++  --topk-advantage "${TOPK_ADVANTAGE}" \
++  --save-dir "${OUTPUT_ROOT}/topk_k${TOP_K}" \
++  "$@"
++
++echo "============================================================"
++echo "Done."
++echo "OPSA:  ${OUTPUT_ROOT}/opsa"
++echo "Top-K: ${OUTPUT_ROOT}/topk_k${TOP_K}"
++echo "============================================================"

@@ -38,7 +38,7 @@ def validate_opsa_args(args) -> None:
         raise ValueError("--opsa-advantage-min/max must satisfy min < max < 0.")
     if args.opsa_mode == "entropy":
         if args.opsa_fixed_advantage is not None:
-            raise ValueError("--opsa-fixed-advantage is only valid with --opsa-mode=fixed.")
+            raise ValueError("--opsa-fixed-advantage is only valid with --opsa-mode=fixed/topk.")
         args.use_rollout_entropy = True
     elif args.opsa_mode == "fixed":
         if args.entropy_coef != 0:
@@ -47,6 +47,18 @@ def validate_opsa_args(args) -> None:
             raise ValueError("--opsa-mode=fixed requires a non-zero --opsa-fixed-advantage.")
         if args.use_rollout_entropy:
             raise ValueError("--opsa-mode=fixed does not compute entropy; remove --use-rollout-entropy.")
+        args.use_rollout_entropy = False
+    elif args.opsa_mode == "topk":
+        if args.entropy_coef != 0:
+            raise ValueError("--opsa-mode=topk requires --entropy-coef=0.")
+        if args.opsa_fixed_advantage is None or args.opsa_fixed_advantage >= 0:
+            raise ValueError("--opsa-mode=topk requires a negative --opsa-fixed-advantage.")
+        if args.opsa_top_k <= 0:
+            raise ValueError("--opsa-top-k must be a positive integer.")
+        if getattr(args, "context_parallel_size", 1) != 1:
+            raise ValueError("--opsa-mode=topk currently requires --context-parallel-size=1.")
+        if args.use_rollout_entropy:
+            raise ValueError("--opsa-mode=topk does not compute entropy; remove --use-rollout-entropy.")
         args.use_rollout_entropy = False
     else:
         raise ValueError(f"Unsupported OPSA mode: {args.opsa_mode!r}.")
