@@ -5,6 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
+#SBATCH --chdir=/projects/u6os/public/mingyu/opsa/slime
 #SBATCH -o slurm.%j.%N.out
 #SBATCH -e slurm.%j.%N.err
 
@@ -35,16 +36,15 @@ export LIBRARY_PATH="$CUDNN_ROOT/lib:$MATHLIB_HOME/lib64:$CUDA_HOME/lib64${LIBRA
 export LD_LIBRARY_PATH="$CUDNN_ROOT/lib:$MATHLIB_HOME/lib64:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TORCH_CUDA_ARCH_LIST=9.0
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
-
-# Defaults for Mingyu's 4-GPU Qwen3-1.7B experiments.
-# Every value can still be overridden by environment variables or CLI flags.
-OPSA_ROOT="${OPSA_ROOT:-$(cd -- "${SLIME_ROOT}/.." >/dev/null 2>&1 && pwd)}"
-MINGYU_ROOT="${MINGYU_ROOT:-$(cd -- "${OPSA_ROOT}/.." >/dev/null 2>&1 && pwd)}"
-OPSA_DATA_DIR="${OPSA_DATA_DIR:-${OPSA_ROOT}/data}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${OPSA_ROOT}/outputs}"
-TRITON_HOME="${TRITON_HOME:-${MINGYU_ROOT}/.triton}"
+# IMPORTANT: sbatch copies this script to /var/spool/slurmd/... before running it.
+# Therefore do NOT derive project paths from BASH_SOURCE / dirname $0.
+# Use stable absolute project paths instead. They can still be overridden via env vars.
+MINGYU_ROOT="${MINGYU_ROOT:-/projects/u6os/public/mingyu}"
+OPSA_ROOT="${OPSA_ROOT:-/projects/u6os/public/mingyu/opsa}"
+SLIME_ROOT="${SLIME_ROOT:-/projects/u6os/public/mingyu/opsa/slime}"
+OPSA_DATA_DIR="${OPSA_DATA_DIR:-/projects/u6os/public/mingyu/opsa/data}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/projects/u6os/public/mingyu/opsa/outputs}"
+TRITON_HOME="${TRITON_HOME:-/projects/u6os/public/mingyu/.triton}"
 export TRITON_HOME
 
 MODEL="${MODEL:-qwen3-1.7b}"
@@ -79,7 +79,7 @@ DRY_RUN=false
 usage() {
    cat <<'EOF'
 Usage:
-  bash examples/opsa/run_opsa.sh [options]
+  sbatch examples/opsa/run_opsa.sh [options]
 
 Method:
   --model NAME                qwen3-1.7b, qwen3-4b, or qwen3.5-9b
@@ -373,7 +373,7 @@ if [ -n "$WANDB_PROJECT" ]; then
    fi
 fi
 
-source "${SCRIPT_DIR}/models/${MODEL}.sh"
+source "${SLIME_ROOT}/examples/opsa/models/${MODEL}.sh"
 MODEL_CONFIG="${SLIME_ROOT}/${MODEL_CONFIG_RELATIVE}"
 if [ ! -f "$MODEL_CONFIG" ]; then
    die "model definition not found: $MODEL_CONFIG"
