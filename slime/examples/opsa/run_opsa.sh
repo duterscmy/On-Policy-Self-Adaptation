@@ -1,6 +1,18 @@
 #!/bin/bash
+#SBATCH --job-name="opas_train"
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:4
+#SBATCH --time=24:00:00
+#SBATCH -o slurm.%j.%N.out
+#SBATCH -e slurm.%j.%N.err
 
-set -euo pipefail
+set -eo pipefail
+
+source ~/.bashrc
+conda activate opsa
+
+# set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
