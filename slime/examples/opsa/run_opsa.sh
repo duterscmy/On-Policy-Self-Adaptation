@@ -609,7 +609,7 @@ MISC_ARGS=(
 )
 
 TRAIN_COMMAND=(
-   python3 train.py
+   "${CONDA_PREFIX}/bin/python" "${SLIME_ROOT}/train.py"
    --actor-num-nodes 1
    --actor-num-gpus-per-node "$ACTOR_GPUS"
    --rollout-num-gpus "$ROLLOUT_GPUS"
@@ -688,6 +688,26 @@ else
    echo "W&B:                 disabled"
 fi
 
+# Ray Jobs normally packages --working-dir before submission.  On this cluster the
+# project is already on a shared filesystem, so packaging the whole Slime checkout is
+# unnecessary and can time out at the dashboard (HTTP 504).  Instead, create a tiny
+# launcher on the shared filesystem and submit that absolute path.
+RAY_LAUNCH_DIR="${OPSA_ROOT}/.ray_launchers"
+RAY_LAUNCHER="${RAY_LAUNCH_DIR}/opsa_${SLURM_JOB_ID:-$$}.sh"
+
+make_ray_launcher() {
+   mkdir -p "$RAY_LAUNCH_DIR"
+   {
+      echo '#!/bin/bash'
+      echo 'set -e'
+      printf 'cd %q\n' "$SLIME_ROOT"
+      printf 'exec'
+      printf ' %q' "${TRAIN_COMMAND[@]}"
+      printf '\n'
+   } > "$RAY_LAUNCHER"
+   chmod 700 "$RAY_LAUNCHER"
+}
+
 if [ "$DRY_RUN" = true ]; then
    if [ -n "$RAY_ADDRESS" ]; then
       DRY_RAY_ADDRESS="$RAY_ADDRESS"
@@ -696,14 +716,18 @@ if [ "$DRY_RUN" = true ]; then
       DRY_RAY_ADDRESS="http://127.0.0.1:${DASHBOARD_PORT}"
       echo "Ray:                 start local cluster with $TOTAL_GPUS GPUs (GCS $RAY_PORT, dashboard $DASHBOARD_PORT)"
    fi
-   printf '\n[dry-run]'
-   printf ' %q' ray job submit --address "$DRY_RAY_ADDRESS" --working-dir "$SLIME_ROOT" --runtime-env-json "$RUNTIME_ENV_JSON" -- "${TRAIN_COMMAND[@]}"
+   echo "Ray packaging:       disabled (shared filesystem launcher)"
+   printf '\n[dry-run] launcher command:'
+   printf ' %q' "${TRAIN_COMMAND[@]}"
+   printf '\n[dry-run] ray submit:'
+   printf ' %q' ray job submit --address "$DRY_RAY_ADDRESS" --runtime-env-json "$RUNTIME_ENV_JSON" -- /bin/bash "$RAY_LAUNCHER"
    printf '\n'
    exit 0
 fi
 
 RAY_STARTED_BY_SCRIPT=false
 cleanup() {
+   rm -f "${RAY_LAUNCHER:-}" >/dev/null 2>&1 || true
    if [ "$RAY_STARTED_BY_SCRIPT" = true ]; then
       ray stop --force >/dev/null 2>&1 || true
    fi
@@ -727,9 +751,12 @@ else
    echo "Using existing Ray cluster: $RAY_ADDRESS"
 fi
 
-cd "$SLIME_ROOT"
+make_ray_launcher
+
+echo "Ray packaging:       disabled (shared filesystem launcher)"
+echo "Ray launcher:        $RAY_LAUNCHER"
+
 ray job submit \
    --address "$RAY_ADDRESS" \
-   --working-dir "$SLIME_ROOT" \
    --runtime-env-json "$RUNTIME_ENV_JSON" \
-   -- "${TRAIN_COMMAND[@]}"
+   -- /bin/bash "$RAY_LAUNCHER"
