@@ -5,9 +5,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SLIME_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
 
-MODEL="qwen3-1.7b"
-PRESET="opsa"
-TOKEN_FRACTION="0.2"
+# Defaults for Mingyu's 4-GPU Qwen3-1.7B experiments.
+# Every value can still be overridden by environment variables or CLI flags.
+OPSA_ROOT="${OPSA_ROOT:-$(cd -- "${SLIME_ROOT}/.." >/dev/null 2>&1 && pwd)}"
+MINGYU_ROOT="${MINGYU_ROOT:-$(cd -- "${OPSA_ROOT}/.." >/dev/null 2>&1 && pwd)}"
+OPSA_DATA_DIR="${OPSA_DATA_DIR:-${OPSA_ROOT}/data}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${OPSA_ROOT}/outputs}"
+
+MODEL="${MODEL:-qwen3-1.7b}"
+PRESET="${PRESET:-topk}"
+TOKEN_FRACTION="${TOKEN_FRACTION:-0.2}"
 TOP_K="${TOP_K:-10}"
 TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
 ACTOR_GPUS_OVERRIDE="${ACTOR_GPUS_OVERRIDE:-}"
@@ -17,9 +24,9 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-}"
 ACTOR_CHECKPOINT="${ACTOR_CHECKPOINT:-${REF_LOAD:-}}"
 RESUME_FROM="${RESUME_FROM:-}"
 SAVE_DIR="${SAVE_DIR:-}"
-PROMPT_DATA="${PROMPT_DATA:-}"
-EVAL_DATA="${EVAL_DATA:-}"
-MEGATRON_PATH="${MEGATRON_PATH:-}"
+PROMPT_DATA="${PROMPT_DATA:-${OPSA_DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl}"
+EVAL_DATA="${EVAL_DATA:-${OPSA_DATA_DIR}/aime-2024/aime-2024.jsonl}"
+MEGATRON_PATH="${MEGATRON_PATH:-${MINGYU_ROOT}/models/Megatron-LM}"
 RAY_ADDRESS="${RAY_ADDRESS:-}"
 RAY_PORT="${RAY_PORT:-6379}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8265}"
@@ -258,6 +265,27 @@ case "$PRESET" in
    opsa|fixed-negative|fixed-positive|topk) ;;
    *) die "unsupported preset '$PRESET'" ;;
 esac
+
+# Qwen3-1.7B defaults: 2 actor GPUs + 2 rollout GPUs, plus local checkpoints.
+# Other models keep their model-file GPU defaults unless explicitly overridden.
+if [ "$MODEL" = qwen3-1.7b ]; then
+   ACTOR_GPUS_OVERRIDE="${ACTOR_GPUS_OVERRIDE:-2}"
+   ROLLOUT_GPUS_OVERRIDE="${ROLLOUT_GPUS_OVERRIDE:-2}"
+   HF_CHECKPOINT="${HF_CHECKPOINT:-${MINGYU_ROOT}/models/Qwen3-1.7B}"
+   ACTOR_CHECKPOINT="${ACTOR_CHECKPOINT:-${MINGYU_ROOT}/models/qwen3-1.7b-megatron}"
+fi
+
+# Automatically create a unique output directory when --save-dir is omitted.
+if [ -z "$SAVE_DIR" ]; then
+   RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d-%H%M%S)}"
+   case "$PRESET" in
+      topk) EXP_NAME="topk-k${TOP_K}-advneg${TOPK_ADVANTAGE#-}" ;;
+      opsa) EXP_NAME="opsa-lowest${TOKEN_FRACTION}" ;;
+      fixed-negative) EXP_NAME="fixed-negative-lowest${TOKEN_FRACTION}" ;;
+      fixed-positive) EXP_NAME="fixed-positive-lowest${TOKEN_FRACTION}" ;;
+   esac
+   SAVE_DIR="${OUTPUT_ROOT}/${MODEL}/${EXP_NAME}-${RUN_STAMP}"
+fi
 
 if ! [[ "$TOP_K" =~ ^[1-9][0-9]*$ ]]; then
    die "--top-k/TOP_K must be a positive integer"
