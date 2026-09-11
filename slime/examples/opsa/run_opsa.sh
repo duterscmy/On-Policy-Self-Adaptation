@@ -688,37 +688,16 @@ else
    echo "W&B:                 disabled"
 fi
 
-# On this Slurm cluster we deliberately do NOT use `ray job submit`.
-# The Ray Jobs dashboard API has been returning HTTP 504 even when no working-dir
-# package is uploaded.  Since this is a single-node Slurm allocation, run the
-# driver directly inside the allocation and connect it to the local Ray head via
-# the GCS address.  This removes the dashboard/job-submission layer entirely.
+# Single-node Slurm mode: let the Python driver create its own local Ray
+# runtime with ray.init().  Do NOT start `ray start` separately and then attach
+# to it.  On this cluster the attach path has repeatedly hung inside ray.init().
+# Starting Ray from the driver removes the GCS/raylet attachment handshake,
+# Ray Jobs API, dashboard, and repository packaging layers.
 
-if [ "$DRY_RUN" = true ]; then
-   echo "Ray launch mode:     direct driver (no Ray Jobs API)"
-   printf '\n[dry-run] ray start:'
-   printf ' %q' ray start --head --node-ip-address "<SLURM_NODE_IP>" --port "$RAY_PORT" --num-gpus "$TOTAL_GPUS" --disable-usage-stats --include-dashboard=false
-   printf '\n[dry-run] train:'
-   printf ' %q' "${TRAIN_COMMAND[@]}"
-   printf '\n'
-   exit 0
+if [ -n "$RAY_ADDRESS" ]; then
+   die "this single-node Slurm launcher intentionally does not reuse an external Ray cluster; unset RAY_ADDRESS"
 fi
 
-RAY_STARTED_BY_SCRIPT=false
-cleanup() {
-   if [ "$RAY_STARTED_BY_SCRIPT" = true ]; then
-      ray stop --force >/dev/null 2>&1 || true
-   fi
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# This launcher is designed for a fresh single-node Slurm allocation.
-# IMPORTANT: do not use 127.0.0.1 for Ray on this cluster.  Ray advertises the
-# compute node's real IP (10.x.x.x), and connecting the driver to localhost can
-# hang indefinitely.  Resolve the Slurm node's IPv4 address and use that exact
-# address for both the Ray head and the driver.
 NODE_IP="$(
 python3 - <<'PY_NODE_IP'
 import socket
@@ -730,8 +709,6 @@ except OSError:
     pass
 ips = [ip for ip in ips if ":" not in ip and not ip.startswith("127.")]
 if not ips:
-    # UDP connect does not send traffic; it only asks the kernel which local
-    # interface/address would be used for an outbound route.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 53))
@@ -744,94 +721,98 @@ print(ips[0])
 PY_NODE_IP
 )"
 [ -n "$NODE_IP" ] || die "failed to determine Slurm node IP"
-echo "Slurm/Ray node IP:   $NODE_IP"
 
-if [ -z "$RAY_ADDRESS" ]; then
-   ray start \
-      --head \
-      --node-ip-address "$NODE_IP" \
-      --port "$RAY_PORT" \
-      --num-gpus "$TOTAL_GPUS" \
-      --disable-usage-stats \
-      --include-dashboard=false
-   RAY_STARTED_BY_SCRIPT=true
-   RAY_GCS_ADDRESS="${NODE_IP}:${RAY_PORT}"
-else
-   # Accept either a raw GCS address (host:port) or ray://host:port here.
-   # HTTP dashboard URLs are intentionally not supported in direct-driver mode.
-   case "$RAY_ADDRESS" in
-      http://*|https://*)
-         die "direct Ray mode needs a GCS address such as ${NODE_IP}:${RAY_PORT}, not a dashboard URL ($RAY_ADDRESS)"
-         ;;
-      ray://*) RAY_GCS_ADDRESS="${RAY_ADDRESS#ray://}" ;;
-      *)       RAY_GCS_ADDRESS="$RAY_ADDRESS" ;;
-   esac
-   echo "Using existing Ray cluster GCS: $RAY_GCS_ADDRESS"
-fi
+RAY_NUM_CPUS="${SLURM_CPUS_PER_TASK:-16}"
+RAY_NUM_GPUS="$TOTAL_GPUS"
 
-# The driver itself also needs the same import/library environment that the Ray
-# workers receive.
+# Keep Ray's session/socket files job-local.  This avoids stale state in
+# /tmp/ray from an earlier Slurm job on the same compute node.
+RAY_TMPDIR="${TMPDIR:-/tmp}/ray-opsa-${SLURM_JOB_ID:-$$}"
+mkdir -p "$RAY_TMPDIR"
+
 export PYTHONPATH="$RUNTIME_PYTHONPATH"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE="$HAS_NVLINK"
 export SGLANG_DISABLE_CUDNN_CHECK=1
-export RAY_GCS_ADDRESS
+
+export RAY_NODE_IP="$NODE_IP"
+export RAY_NUM_CPUS
+export RAY_NUM_GPUS
+export RAY_TMPDIR
+
+echo "Ray launch mode:     local ray.init() inside driver"
+echo "Ray node IP:         $RAY_NODE_IP"
+echo "Ray CPUs/GPUs:       ${RAY_NUM_CPUS}/${RAY_NUM_GPUS}"
+echo "Ray temp dir:        $RAY_TMPDIR"
+
+if [ "$DRY_RUN" = true ]; then
+   printf '\n[dry-run] train:'
+   printf ' %q' "${TRAIN_COMMAND[@]}"
+   printf '\n'
+   exit 0
+fi
 
 cd "$SLIME_ROOT"
 
-echo "Ray launch mode:     direct driver (no Ray Jobs API)"
-echo "Ray GCS address:     $RAY_GCS_ADDRESS"
-echo "Starting Slime driver directly..."
+echo "Starting Slime driver; Python will create the local Ray runtime..."
 
-# Explicitly connect the driver to the Ray head before executing train.py.
-# train.py itself uses Ray but does not call ray.init(), so the small wrapper
-# below makes the connection deterministic and supplies the runtime env to all
-# Ray actors/workers.
 "${CONDA_PREFIX}/bin/python" -u - "$SLIME_ROOT/train.py" "${TRAIN_COMMAND[@]:2}" <<'PY_DIRECT_DRIVER'
 import os
 import runpy
+import signal
 import sys
+
+# Keep BLAS/OpenMP from creating huge thread pools during Ray startup on HPC
+# nodes.  Slime/Ray actors can still use their explicitly allocated CPUs.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import ray
 
 train_py = sys.argv[1]
 train_args = sys.argv[2:]
 
-runtime_keys = [
-    "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "CPLUS_INCLUDE_PATH",
-    "CUDA_HOME", "MATHLIB_HOME", "NCCL_INCLUDE", "CUDNN_ROOT",
-    "TRITON_HOME", "TORCH_CUDA_ARCH_LIST", "PYTHONPATH",
-    "CUDA_DEVICE_MAX_CONNECTIONS", "NCCL_NVLS_ENABLE",
-    "SGLANG_DISABLE_CUDNN_CHECK",
-]
-runtime_env = {
-    "env_vars": {k: os.environ[k] for k in runtime_keys if k in os.environ}
-}
+node_ip = os.environ["RAY_NODE_IP"]
+num_cpus = int(os.environ["RAY_NUM_CPUS"])
+num_gpus = int(os.environ["RAY_NUM_GPUS"])
+temp_dir = os.environ["RAY_TMPDIR"]
 
-print(f"[ray] cluster GCS advertised as {os.environ['RAY_GCS_ADDRESS']}", flush=True)
-print("[ray] connecting driver with address='auto' ...", flush=True)
-
-# `ray start` writes the current cluster address locally.  Using address="auto"
-# avoids a loopback-vs-node-IP mismatch while still attaching to exactly the
-# Ray cluster started inside this Slurm allocation.
-import signal
+print(
+    f"[ray] starting local runtime: node_ip={node_ip}, "
+    f"cpus={num_cpus}, gpus={num_gpus}, temp_dir={temp_dir}",
+    flush=True,
+)
 
 def _ray_init_timeout(signum, frame):
-    raise TimeoutError("ray.init(address='auto') did not complete within 120 seconds")
+    raise TimeoutError(
+        "local ray.init() did not complete within 120 seconds; "
+        f"inspect {temp_dir}/session_latest/logs/"
+    )
 
 signal.signal(signal.SIGALRM, _ray_init_timeout)
 signal.alarm(120)
 try:
-    ray.init(
-        address="auto",
-        runtime_env=runtime_env,
+    ctx = ray.init(
+        num_cpus=num_cpus,
+        num_gpus=num_gpus,
+        include_dashboard=False,
+        _node_ip_address=node_ip,
+        _temp_dir=temp_dir,
         log_to_driver=True,
     )
 finally:
     signal.alarm(0)
 
-print("[ray] driver connected", flush=True)
+print("[ray] local runtime started", flush=True)
+print("[ray] address:", ctx.address_info.get("address"), flush=True)
 print("[ray] cluster resources:", ray.cluster_resources(), flush=True)
 
 sys.argv = [train_py, *train_args]
-runpy.run_path(train_py, run_name="__main__")
+try:
+    runpy.run_path(train_py, run_name="__main__")
+finally:
+    print("[ray] shutting down local runtime", flush=True)
+    ray.shutdown()
 PY_DIRECT_DRIVER
