@@ -101,7 +101,7 @@ Paths:
 Runtime:
   --actor-gpus INTEGER        Override actor GPU count from the model preset
   --rollout-gpus INTEGER      Override rollout GPU count from the model preset
-  --ray-address URL           Submit to an existing Ray dashboard
+  --ray-address HOST:PORT     Reuse an existing Ray GCS address
   --ray-port PORT             Local Ray GCS port (default: 6379)
   --dashboard-port PORT       Local Ray dashboard port (default: 8265)
   --light-checkpoint          Omit optimizer and RNG state (not resumable)
@@ -352,7 +352,7 @@ validate_port() {
 }
 
 port_is_free() {
-   python3 -c 'import socket, sys; sock = socket.socket(); sock.bind(("127.0.0.1", int(sys.argv[1]))); sock.close()' "$1" 2>/dev/null
+   python3 -c 'import socket, sys; sock = socket.socket(); sock.bind(("0.0.0.0", int(sys.argv[1]))); sock.close()' "$1" 2>/dev/null
 }
 
 validate_port "--ray-port" "$RAY_PORT"
@@ -697,7 +697,7 @@ fi
 if [ "$DRY_RUN" = true ]; then
    echo "Ray launch mode:     direct driver (no Ray Jobs API)"
    printf '\n[dry-run] ray start:'
-   printf ' %q' ray start --head --node-ip-address 127.0.0.1 --port "$RAY_PORT" --num-gpus "$TOTAL_GPUS" --disable-usage-stats --include-dashboard=false
+   printf ' %q' ray start --head --node-ip-address "<SLURM_NODE_IP>" --port "$RAY_PORT" --num-gpus "$TOTAL_GPUS" --disable-usage-stats --include-dashboard=false
    printf '\n[dry-run] train:'
    printf ' %q' "${TRAIN_COMMAND[@]}"
    printf '\n'
@@ -714,25 +714,54 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# This launcher is designed for a fresh single-node Slurm allocation.  If a
-# RAY_ADDRESS was explicitly supplied, use that GCS address; otherwise start a
-# local head.  For local runs we do not need the Ray dashboard at all.
+# This launcher is designed for a fresh single-node Slurm allocation.
+# IMPORTANT: do not use 127.0.0.1 for Ray on this cluster.  Ray advertises the
+# compute node's real IP (10.x.x.x), and connecting the driver to localhost can
+# hang indefinitely.  Resolve the Slurm node's IPv4 address and use that exact
+# address for both the Ray head and the driver.
+NODE_IP="$(
+python3 - <<'PY_NODE_IP'
+import socket
+name = socket.gethostname()
+ips = []
+try:
+    ips.extend(socket.gethostbyname_ex(name)[2])
+except OSError:
+    pass
+ips = [ip for ip in ips if ":" not in ip and not ip.startswith("127.")]
+if not ips:
+    # UDP connect does not send traffic; it only asks the kernel which local
+    # interface/address would be used for an outbound route.
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 53))
+        ips.append(s.getsockname()[0])
+    finally:
+        s.close()
+if not ips:
+    raise SystemExit("could not determine the Slurm node IPv4 address")
+print(ips[0])
+PY_NODE_IP
+)"
+[ -n "$NODE_IP" ] || die "failed to determine Slurm node IP"
+echo "Slurm/Ray node IP:   $NODE_IP"
+
 if [ -z "$RAY_ADDRESS" ]; then
    ray start \
       --head \
-      --node-ip-address 127.0.0.1 \
+      --node-ip-address "$NODE_IP" \
       --port "$RAY_PORT" \
       --num-gpus "$TOTAL_GPUS" \
       --disable-usage-stats \
       --include-dashboard=false
    RAY_STARTED_BY_SCRIPT=true
-   RAY_GCS_ADDRESS="127.0.0.1:${RAY_PORT}"
+   RAY_GCS_ADDRESS="${NODE_IP}:${RAY_PORT}"
 else
    # Accept either a raw GCS address (host:port) or ray://host:port here.
    # HTTP dashboard URLs are intentionally not supported in direct-driver mode.
    case "$RAY_ADDRESS" in
       http://*|https://*)
-         die "direct Ray mode needs a GCS address such as 127.0.0.1:${RAY_PORT}, not a dashboard URL ($RAY_ADDRESS)"
+         die "direct Ray mode needs a GCS address such as ${NODE_IP}:${RAY_PORT}, not a dashboard URL ($RAY_ADDRESS)"
          ;;
       ray://*) RAY_GCS_ADDRESS="${RAY_ADDRESS#ray://}" ;;
       *)       RAY_GCS_ADDRESS="$RAY_ADDRESS" ;;
@@ -778,13 +807,30 @@ runtime_env = {
     "env_vars": {k: os.environ[k] for k in runtime_keys if k in os.environ}
 }
 
-print(f"[ray] connecting driver to {os.environ['RAY_GCS_ADDRESS']}", flush=True)
-ray.init(
-    address=os.environ["RAY_GCS_ADDRESS"],
-    runtime_env=runtime_env,
-    log_to_driver=True,
-)
+print(f"[ray] cluster GCS advertised as {os.environ['RAY_GCS_ADDRESS']}", flush=True)
+print("[ray] connecting driver with address='auto' ...", flush=True)
+
+# `ray start` writes the current cluster address locally.  Using address="auto"
+# avoids a loopback-vs-node-IP mismatch while still attaching to exactly the
+# Ray cluster started inside this Slurm allocation.
+import signal
+
+def _ray_init_timeout(signum, frame):
+    raise TimeoutError("ray.init(address='auto') did not complete within 120 seconds")
+
+signal.signal(signal.SIGALRM, _ray_init_timeout)
+signal.alarm(120)
+try:
+    ray.init(
+        address="auto",
+        runtime_env=runtime_env,
+        log_to_driver=True,
+    )
+finally:
+    signal.alarm(0)
+
 print("[ray] driver connected", flush=True)
+print("[ray] cluster resources:", ray.cluster_resources(), flush=True)
 
 sys.argv = [train_py, *train_args]
 runpy.run_path(train_py, run_name="__main__")
