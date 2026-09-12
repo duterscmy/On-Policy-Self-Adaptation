@@ -566,6 +566,7 @@ fi
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "$ROLLOUT_GPUS_PER_ENGINE"
    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
+   --sglang-attention-backend triton
 )
 
 WANDB_ARGS=()
