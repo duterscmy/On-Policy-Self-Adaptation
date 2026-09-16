@@ -1,4 +1,5 @@
 from argparse import Namespace
+import logging
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -31,6 +32,8 @@ from .cp_utils import (
 )
 from .opd import apply_opd_kl_to_advantages
 from .opsa import compute_opsa
+
+logger = logging.getLogger(__name__)
 
 
 def get_responses(
@@ -506,7 +509,7 @@ def get_log_probs_and_entropy(
     topk_violation_masks = None
     if (
         args.advantage_estimator == "opsa"
-        and args.opsa_mode == "topk"
+        and args.opsa_mode in {"topk", "seq_topk"}
         and not torch.is_grad_enabled()
     ):
         topk_violation_masks = _compute_topk_violation_masks(
@@ -641,6 +644,66 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _gather_seq_topk_diagnostics(args: Namespace, local_stats: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[int, bool]]:
+    """Gather sequence Top-K diagnostics across DP ranks and reconstruct prompt groups.
+
+    ``sample.index`` is allocated consecutively inside each prompt group before
+    DP partitioning, so ``sample_index // n_samples_per_prompt`` recovers a
+    stable group id even when length balancing scatters siblings across ranks.
+    Returns the globally gathered sample stats and a map from group id to
+    whether that prompt contains both clean and violating rollouts.
+    """
+    dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    dp_world_size = dist.get_world_size(dp_group)
+    gathered: list[list[dict[str, Any]] | None] = [None for _ in range(dp_world_size)]
+    dist.all_gather_object(gathered, local_stats, group=dp_group)
+
+    global_stats = [item for rank_stats in gathered if rank_stats is not None for item in rank_stats]
+    global_stats.sort(key=lambda item: int(item["sample_index"]))
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for item in global_stats:
+        group_id = int(item["sample_index"]) // int(args.n_samples_per_prompt)
+        item["group_id"] = group_id
+        grouped.setdefault(group_id, []).append(item)
+
+    mixed_by_group: dict[int, bool] = {}
+    for group_id, items in grouped.items():
+        has_clean = any(not bool(item["has_violation"]) for item in items)
+        has_violation = any(bool(item["has_violation"]) for item in items)
+        mixed_by_group[group_id] = has_clean and has_violation
+
+    if getattr(args, "opsa_seq_log_details", False):
+        if (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        ):
+            for group_id in sorted(grouped):
+                items = sorted(grouped[group_id], key=lambda item: int(item["sample_index"]))
+                has_policy_gradient = any(float(item["advantage"]) != 0.0 for item in items)
+                has_contrastive_signal = mixed_by_group[group_id]
+                detail = "; ".join(
+                    (
+                        f"r{j}:sample={item['sample_index']},resp_len={item['response_length']},"
+                        f"train_len={item['trainable_length']},viol={item['violation_count']},"
+                        f"has_viol={int(bool(item['has_violation']))},adv={item['advantage']:+.4f}"
+                    )
+                    for j, item in enumerate(items)
+                )
+                logger.info(
+                    "[seq_topk] group=%s rollouts=%s/%s mixed_signal=%s "
+                    "has_policy_gradient=%s details=[%s]",
+                    group_id,
+                    len(items),
+                    args.n_samples_per_prompt,
+                    has_contrastive_signal,
+                    has_policy_gradient,
+                    detail,
+                )
+
+    return global_stats, mixed_by_group
+
+
 def _compute_opsa_for_rollout(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -659,7 +722,7 @@ def _compute_opsa_for_rollout(
         raise ValueError("OPSA entropy mode requires actor entropy from the log-prob forward pass.")
 
     cp_size = mpu.get_context_parallel_world_size()
-    if args.opsa_mode == "topk":
+    if args.opsa_mode in {"topk", "seq_topk"}:
         violation_masks = rollout_data.get("opsa_topk_violation_mask")
         if violation_masks is None:
             raise ValueError(
@@ -670,37 +733,127 @@ def _compute_opsa_for_rollout(
         if len(violation_masks) != len(student_log_probs):
             raise ValueError("Top-K violation-mask count does not match actor log-prob count.")
 
-        advantages = []
-        topk_loss_masks = []
-        for log_prob, loss_mask, violation_mask in zip(
-            student_log_probs, loss_masks, violation_masks, strict=True
+        if args.opsa_mode == "topk":
+            advantages = []
+            topk_loss_masks = []
+            for log_prob, loss_mask, violation_mask in zip(
+                student_log_probs, loss_masks, violation_masks, strict=True
+            ):
+                if log_prob.shape != loss_mask.shape or log_prob.shape != violation_mask.shape:
+                    raise ValueError(
+                        "Top-K OPSA tensors must have matching response shapes: "
+                        f"log_prob={tuple(log_prob.shape)}, loss_mask={tuple(loss_mask.shape)}, "
+                        f"violation_mask={tuple(violation_mask.shape)}."
+                    )
+                selected = loss_mask.bool() & violation_mask.bool()
+                advantage = torch.zeros_like(log_prob)
+                advantage[selected] = args.opsa_fixed_advantage
+                advantages.append(advantage)
+                topk_loss_masks.append(selected.to(dtype=loss_mask.dtype))
+
+            selected_tokens = sum(mask.float().sum() for mask in topk_loss_masks)
+            valid_tokens = sum(mask.float().sum() for mask in loss_masks)
+            device = student_log_probs[0].device
+            rollout_data["opsa_loss_mask"] = topk_loss_masks
+            rollout_data["opsa/selected_fraction"] = (
+                selected_tokens / torch.clamp_min(valid_tokens, 1.0)
+            ).detach()
+            rollout_data["opsa/selected_tokens"] = selected_tokens.detach()
+            rollout_data["opsa/valid_tokens"] = valid_tokens.detach()
+            rollout_data["opsa/advantage_mean"] = torch.where(
+                selected_tokens > 0,
+                torch.tensor(float(args.opsa_fixed_advantage), device=device),
+                torch.zeros((), dtype=torch.float32, device=device),
+            ).detach()
+            rollout_data["opsa/top_k"] = torch.tensor(
+                float(args.opsa_top_k), dtype=torch.float32, device=device
+            )
+            return advantages, [advantage.clone() for advantage in advantages]
+
+        # Sequence-level Top-K: a rollout is positive only if *none* of its
+        # trainable response tokens are outside the current actor Top-K.  The
+        # resulting scalar is broadcast to every valid token in that response.
+        sample_indices = rollout_data.get("sample_indices")
+        if sample_indices is None or len(sample_indices) != len(student_log_probs):
+            raise ValueError("seq_topk requires one sample_index per local rollout for group diagnostics.")
+
+        advantages: list[torch.Tensor] = []
+        seq_loss_masks: list[torch.Tensor] = []
+        local_stats: list[dict[str, Any]] = []
+        violation_count_tensors: list[torch.Tensor] = []
+        has_violation_tensors: list[torch.Tensor] = []
+        seq_advantage_tensors: list[torch.Tensor] = []
+
+        for sample_index, response_length, log_prob, loss_mask, violation_mask in zip(
+            sample_indices, response_lengths, student_log_probs, loss_masks, violation_masks, strict=True
         ):
             if log_prob.shape != loss_mask.shape or log_prob.shape != violation_mask.shape:
                 raise ValueError(
-                    "Top-K OPSA tensors must have matching response shapes: "
+                    "Sequence Top-K OPSA tensors must have matching response shapes: "
                     f"log_prob={tuple(log_prob.shape)}, loss_mask={tuple(loss_mask.shape)}, "
                     f"violation_mask={tuple(violation_mask.shape)}."
                 )
-            selected = loss_mask.bool() & violation_mask.bool()
-            advantage = torch.zeros_like(log_prob)
-            advantage[selected] = args.opsa_fixed_advantage
-            advantages.append(advantage)
-            topk_loss_masks.append(selected.to(dtype=loss_mask.dtype))
 
-        selected_tokens = sum(mask.float().sum() for mask in topk_loss_masks)
+            valid = loss_mask.bool()
+            violating_valid = valid & violation_mask.bool()
+            violation_count = int(violating_valid.sum().item())
+            has_violation = violation_count > 0
+            scalar_advantage = (
+                float(args.opsa_seq_negative_advantage)
+                if has_violation
+                else float(args.opsa_seq_positive_advantage)
+            )
+
+            advantage = torch.zeros_like(log_prob)
+            advantage[valid] = scalar_advantage
+            advantages.append(advantage)
+            seq_loss_masks.append(valid.to(dtype=loss_mask.dtype))
+
+            device = log_prob.device
+            violation_count_tensors.append(torch.tensor([float(violation_count)], device=device))
+            has_violation_tensors.append(torch.tensor([float(has_violation)], device=device))
+            seq_advantage_tensors.append(torch.tensor([scalar_advantage], device=device))
+            local_stats.append(
+                {
+                    "sample_index": int(sample_index),
+                    "response_length": int(response_length),
+                    "trainable_length": int(valid.sum().item()),
+                    "violation_count": violation_count,
+                    "has_violation": has_violation,
+                    "advantage": scalar_advantage,
+                }
+            )
+
+        _, mixed_by_group = _gather_seq_topk_diagnostics(args, local_stats)
+        mixed_tensors = []
+        for sample_index, log_prob in zip(sample_indices, student_log_probs, strict=True):
+            group_id = int(sample_index) // int(args.n_samples_per_prompt)
+            mixed_tensors.append(
+                torch.tensor([float(mixed_by_group.get(group_id, False))], device=log_prob.device)
+            )
+
         valid_tokens = sum(mask.float().sum() for mask in loss_masks)
+        total_violation_tokens = sum(value for value in violation_count_tensors)
+        total_rollouts = max(len(student_log_probs), 1)
+        clean_rollouts = sum(1.0 - value for value in has_violation_tensors)
         device = student_log_probs[0].device
-        rollout_data["opsa_loss_mask"] = topk_loss_masks
-        rollout_data["opsa/selected_fraction"] = (
-            selected_tokens / torch.clamp_min(valid_tokens, 1.0)
+
+        rollout_data["opsa_loss_mask"] = seq_loss_masks
+        rollout_data["opsa_seq/violation_count"] = violation_count_tensors
+        rollout_data["opsa_seq/has_violation"] = has_violation_tensors
+        rollout_data["opsa_seq/assigned_advantage"] = seq_advantage_tensors
+        rollout_data["opsa_seq/mixed_group_signal"] = mixed_tensors
+        rollout_data["opsa_seq/clean_fraction"] = (clean_rollouts / float(total_rollouts)).detach()
+        rollout_data["opsa_seq/mean_violation_count"] = (
+            total_violation_tokens / float(total_rollouts)
         ).detach()
-        rollout_data["opsa/selected_tokens"] = selected_tokens.detach()
+        rollout_data["opsa/selected_fraction"] = torch.tensor(1.0, device=device)
+        rollout_data["opsa/selected_tokens"] = valid_tokens.detach()
         rollout_data["opsa/valid_tokens"] = valid_tokens.detach()
-        rollout_data["opsa/advantage_mean"] = torch.where(
-            selected_tokens > 0,
-            torch.tensor(float(args.opsa_fixed_advantage), device=device),
-            torch.zeros((), dtype=torch.float32, device=device),
-        ).detach()
+        if seq_advantage_tensors:
+            rollout_data["opsa/advantage_mean"] = torch.stack(seq_advantage_tensors).mean().detach()
+        else:
+            rollout_data["opsa/advantage_mean"] = torch.zeros((), dtype=torch.float32, device=device)
         rollout_data["opsa/top_k"] = torch.tensor(
             float(args.opsa_top_k), dtype=torch.float32, device=device
         )

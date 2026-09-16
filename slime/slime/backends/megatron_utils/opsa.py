@@ -48,17 +48,25 @@ def validate_opsa_args(args) -> None:
         if args.use_rollout_entropy:
             raise ValueError("--opsa-mode=fixed does not compute entropy; remove --use-rollout-entropy.")
         args.use_rollout_entropy = False
-    elif args.opsa_mode == "topk":
+    elif args.opsa_mode in {"topk", "seq_topk"}:
         if args.entropy_coef != 0:
-            raise ValueError("--opsa-mode=topk requires --entropy-coef=0.")
-        if args.opsa_fixed_advantage is None or args.opsa_fixed_advantage >= 0:
-            raise ValueError("--opsa-mode=topk requires a negative --opsa-fixed-advantage.")
+            raise ValueError(f"--opsa-mode={args.opsa_mode} requires --entropy-coef=0.")
+        if args.opsa_mode == "topk":
+            if args.opsa_fixed_advantage is None or args.opsa_fixed_advantage >= 0:
+                raise ValueError("--opsa-mode=topk requires a negative --opsa-fixed-advantage.")
+        else:
+            if args.opsa_fixed_advantage is not None:
+                raise ValueError("--opsa-fixed-advantage is not used by --opsa-mode=seq_topk; use --opsa-seq-positive-advantage/--opsa-seq-negative-advantage.")
+            if args.opsa_seq_positive_advantage <= 0:
+                raise ValueError("--opsa-seq-positive-advantage must be > 0.")
+            if args.opsa_seq_negative_advantage >= 0:
+                raise ValueError("--opsa-seq-negative-advantage must be < 0.")
         if args.opsa_top_k <= 0:
             raise ValueError("--opsa-top-k must be a positive integer.")
         if getattr(args, "context_parallel_size", 1) != 1:
-            raise ValueError("--opsa-mode=topk currently requires --context-parallel-size=1.")
+            raise ValueError(f"--opsa-mode={args.opsa_mode} currently requires --context-parallel-size=1.")
         if args.use_rollout_entropy:
-            raise ValueError("--opsa-mode=topk does not compute entropy; remove --use-rollout-entropy.")
+            raise ValueError(f"--opsa-mode={args.opsa_mode} does not compute entropy; remove --use-rollout-entropy.")
         args.use_rollout_entropy = False
     else:
         raise ValueError(f"Unsupported OPSA mode: {args.opsa_mode!r}.")

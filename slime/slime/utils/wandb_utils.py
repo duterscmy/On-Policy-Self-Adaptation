@@ -17,6 +17,10 @@ _OPSA_CONFIG_KEYS = (
     "opsa_advantage_min",
     "opsa_advantage_max",
     "opsa_fixed_advantage",
+    "opsa_top_k",
+    "opsa_seq_positive_advantage",
+    "opsa_seq_negative_advantage",
+    "opsa_seq_log_details",
     # Model architecture.
     "model_name",
     "num_layers",

@@ -947,11 +947,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsa-mode",
                 type=str,
-                choices=["entropy", "fixed", "topk"],
+                choices=["entropy", "fixed", "topk", "seq_topk"],
                 default="entropy",
                 help=(
                     "Assign entropy-ranked/fixed advantages to lowest-logp tokens, "
-                    "or suppress sampled tokens outside the actor Top-K."
+                    "suppress sampled tokens outside the actor Top-K, or assign a sequence-level "
+                    "Top-K advantage to every valid token in a rollout."
                 ),
             )
             parser.add_argument(
@@ -964,7 +965,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--opsa-top-k",
                 type=int,
                 default=10,
-                help="For --opsa-mode=topk, suppress sampled response tokens whose actor rank is larger than K.",
+                help="For --opsa-mode=topk/seq_topk, treat sampled response tokens whose actor rank is larger than K as violations.",
             )
             parser.add_argument(
                 "--opsa-advantage-min",
@@ -983,6 +984,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=None,
                 help="Non-zero advantage required by --opsa-mode=fixed/topk.",
+            )
+            parser.add_argument(
+                "--opsa-seq-positive-advantage",
+                type=float,
+                default=1.0,
+                help="For --opsa-mode=seq_topk, advantage assigned to every valid token in a rollout with zero Top-K violations.",
+            )
+            parser.add_argument(
+                "--opsa-seq-negative-advantage",
+                type=float,
+                default=-1.0,
+                help="For --opsa-mode=seq_topk, advantage assigned to every valid token in a rollout containing at least one Top-K violation.",
+            )
+            parser.add_argument(
+                "--opsa-seq-log-details",
+                action="store_true",
+                help="Log per-prompt/per-rollout sequence Top-K diagnostics (length, violation count, assigned advantage, and mixed-signal status).",
             )
             return parser
 
