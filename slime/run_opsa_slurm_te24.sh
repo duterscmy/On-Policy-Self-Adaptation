@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name="opsa_train"
+#SBATCH --job-name="seqtopk_n1"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
 #SBATCH --chdir=/projects/u6os/public/mingyu/opsa/slime
-#SBATCH -o slurm.%j.%N.out
-#SBATCH -e slurm.%j.%N.err
+#SBATCH -o slurm.seqtopk_n1.%j.%N.out
+#SBATCH -e slurm.seqtopk_n1.%j.%N.err
 
 set -eo pipefail
 
@@ -59,10 +59,15 @@ TRITON_HOME="${TRITON_HOME:-/projects/u6os/public/mingyu/.triton}"
 export TRITON_HOME
 
 MODEL="${MODEL:-qwen3-1.7b}"
-PRESET="${PRESET:-topk}"
+PRESET="${PRESET:-seq-topk}"
 TOKEN_FRACTION="${TOKEN_FRACTION:-0.2}"
 TOP_K="${TOP_K:-10}"
 TOPK_ADVANTAGE="${TOPK_ADVANTAGE:--0.5}"
+SEQ_TOPK_POSITIVE_ADVANTAGE="${SEQ_TOPK_POSITIVE_ADVANTAGE:-1.0}"
+SEQ_TOPK_NEGATIVE_ADVANTAGE="${SEQ_TOPK_NEGATIVE_ADVANTAGE:--1.0}"
+ROLLOUT_BATCH_SIZE_OVERRIDE="${ROLLOUT_BATCH_SIZE_OVERRIDE:-}"
+N_SAMPLES_PER_PROMPT_OVERRIDE="${N_SAMPLES_PER_PROMPT_OVERRIDE:-}"
+GLOBAL_BATCH_SIZE_OVERRIDE="${GLOBAL_BATCH_SIZE_OVERRIDE:-}"
 ACTOR_GPUS_OVERRIDE="${ACTOR_GPUS_OVERRIDE:-}"
 ROLLOUT_GPUS_OVERRIDE="${ROLLOUT_GPUS_OVERRIDE:-}"
 NUM_ROLLOUT_OVERRIDE="${NUM_ROLLOUT_OVERRIDE:-}"
@@ -94,10 +99,12 @@ Usage:
 
 Method:
   --model NAME                qwen3-1.7b, qwen3-4b, or qwen3.5-9b
-  --preset NAME               opsa, fixed-negative, fixed-positive, or topk
+  --preset NAME               opsa, fixed-negative, fixed-positive, topk, or seq-topk
   --fraction FLOAT            Lowest-token fraction in (0, 1] (default: 0.2)
   --top-k INTEGER             Top-K support for --preset topk (default: 10)
-  --topk-advantage FLOAT      Negative Top-K suppression advantage (default: -0.5)
+  --topk-advantage FLOAT      Negative token-level Top-K suppression advantage (default: -0.5)
+  --seq-pos-advantage FLOAT   Positive clean-rollout advantage for seq-topk (default: +1.0)
+  --seq-neg-advantage FLOAT   Negative violating-rollout advantage for seq-topk (default: -1.0)
   --steps INTEGER             Override the model preset's training steps
 
 Paths:
@@ -185,6 +192,16 @@ while [ "$#" -gt 0 ]; do
       --topk-advantage)
          require_value "$@"
          TOPK_ADVANTAGE="$2"
+         shift 2
+         ;;
+      --seq-pos-advantage)
+         require_value "$@"
+         SEQ_TOPK_POSITIVE_ADVANTAGE="$2"
+         shift 2
+         ;;
+      --seq-neg-advantage)
+         require_value "$@"
+         SEQ_TOPK_NEGATIVE_ADVANTAGE="$2"
          shift 2
          ;;
       --steps)
@@ -309,7 +326,7 @@ case "$MODEL" in
 esac
 
 case "$PRESET" in
-   opsa|fixed-negative|fixed-positive|topk) ;;
+   opsa|fixed-negative|fixed-positive|topk|seq-topk) ;;
    *) die "unsupported preset '$PRESET'" ;;
 esac
 
@@ -327,6 +344,7 @@ if [ -z "$SAVE_DIR" ]; then
    RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d-%H%M%S)}"
    case "$PRESET" in
       topk) EXP_NAME="topk-k${TOP_K}-advneg${TOPK_ADVANTAGE#-}" ;;
+      seq-topk) EXP_NAME="seq-topk-k${TOP_K}-r4-pos1-neg1" ;;
       opsa) EXP_NAME="opsa-lowest${TOKEN_FRACTION}" ;;
       fixed-negative) EXP_NAME="fixed-negative-lowest${TOKEN_FRACTION}" ;;
       fixed-positive) EXP_NAME="fixed-positive-lowest${TOKEN_FRACTION}" ;;
@@ -339,6 +357,10 @@ if ! [[ "$TOP_K" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [ "$PRESET" = topk ] && ! awk -v value="$TOPK_ADVANTAGE" 'BEGIN { exit !(value < 0) }'; then
    die "--topk-advantage/TOPK_ADVANTAGE must be negative"
+fi
+if [ "$PRESET" = seq-topk ]; then
+   awk -v value="$SEQ_TOPK_POSITIVE_ADVANTAGE" 'BEGIN { exit !(value > 0) }' || die "--seq-pos-advantage must be positive"
+   awk -v value="$SEQ_TOPK_NEGATIVE_ADVANTAGE" 'BEGIN { exit !(value < 0) }' || die "--seq-neg-advantage must be negative"
 fi
 
 if ! [[ "$TOKEN_FRACTION" =~ ^(0([.][0-9]+)?|1([.]0*)?)$ ]]; then
@@ -491,6 +513,15 @@ case "$PRESET" in
          --opsa-fixed-advantage "$TOPK_ADVANTAGE"
       )
       ;;
+   seq-topk)
+      OPSA_ARGS=(
+         --opsa-mode seq_topk
+         --opsa-top-k "$TOP_K"
+         --opsa-seq-positive-advantage "$SEQ_TOPK_POSITIVE_ADVANTAGE"
+         --opsa-seq-negative-advantage "$SEQ_TOPK_NEGATIVE_ADVANTAGE"
+         --opsa-seq-log-details
+      )
+      ;;
 esac
 
 CKPT_ARGS=(
@@ -506,6 +537,18 @@ if [ "$LIGHT_CHECKPOINT" = true ]; then
    CKPT_ARGS+=(--no-save-optim --no-save-rng --no-load-optim --no-load-rng)
 fi
 
+if [ "$PRESET" = seq-topk ]; then
+   # Keep the total number of generated training sequences at 64 by default:
+   # 16 prompts x 4 rollouts/prompt = 64 sequences. Override all three if desired.
+   ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE_OVERRIDE:-16}"
+   N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT_OVERRIDE:-4}"
+   GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE_OVERRIDE:-64}"
+else
+   ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE_OVERRIDE:-64}"
+   N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT_OVERRIDE:-1}"
+   GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE_OVERRIDE:-64}"
+fi
+
 ROLLOUT_ARGS=(
    --prompt-data "$PROMPT_DATA"
    --input-key prompt
@@ -513,12 +556,12 @@ ROLLOUT_ARGS=(
    --disable-thinking
    --rollout-shuffle
    --num-rollout "$NUM_ROLLOUT"
-   --rollout-batch-size 64
-   --n-samples-per-prompt 1
+   --rollout-batch-size "$ROLLOUT_BATCH_SIZE"
+   --n-samples-per-prompt "$N_SAMPLES_PER_PROMPT"
    --rollout-max-response-len "$ROLLOUT_MAX_RESPONSE_LEN"
    --rollout-temperature 1
    --num-steps-per-rollout 1
-   --global-batch-size 64
+   --global-batch-size "$GLOBAL_BATCH_SIZE"
    --balance-data
    --custom-rm-path slime.rollout.opsa.reward_func
    --custom-reward-post-process-path slime.rollout.opsa.post_process_rewards
@@ -584,6 +627,8 @@ WANDB_ARGS=()
 if [ -n "$WANDB_PROJECT" ]; then
    if [ "$PRESET" = topk ]; then
       WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-topk${TOP_K}}"
+   elif [ "$PRESET" = seq-topk ]; then
+      WANDB_GROUP="${WANDB_GROUP:-opsa-${MODEL}-seq-topk${TOP_K}-r4-pos1-neg1}"
    else
       fraction_percentage="$(awk -v value="$TOKEN_FRACTION" 'BEGIN { printf "%g", value * 100 }')"
       fraction_percentage="${fraction_percentage//./p}"
@@ -685,6 +730,9 @@ echo "Model:               $MODEL_DISPLAY_NAME"
 echo "Preset:              $PRESET"
 if [ "$PRESET" = topk ]; then
    echo "Top-K suppression:   K=${TOP_K}, advantage=${TOPK_ADVANTAGE}"
+elif [ "$PRESET" = seq-topk ]; then
+   echo "Sequence Top-K:      K=${TOP_K}, clean_adv=${SEQ_TOPK_POSITIVE_ADVANTAGE}, violation_adv=${SEQ_TOPK_NEGATIVE_ADVANTAGE}"
+   echo "Prompt/rollouts:     ${ROLLOUT_BATCH_SIZE} prompts x ${N_SAMPLES_PER_PROMPT} rollouts (GBS=${GLOBAL_BATCH_SIZE})"
 else
    echo "Lowest fraction:     $TOKEN_FRACTION"
 fi
