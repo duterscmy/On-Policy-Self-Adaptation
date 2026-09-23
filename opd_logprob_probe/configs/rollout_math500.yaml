@@ -1,0 +1,39 @@
+experiment_name: math500_qwen3_1p7b_vs_4b
+output_dir: runs/math500_qwen3_1p7b_vs_4b
+seed: 1234
+
+dataset:
+  name: HuggingFaceH4/MATH-500
+  split: test
+  problem_field: problem
+  id_field: null
+  answer_field: answer
+  solution_field: solution
+  num_questions: 30
+  random_subset: true
+
+models:
+  student: Qwen/Qwen3-1.7B
+  teacher: Qwen/Qwen3-4B
+  dtype: bfloat16
+  attn_implementation: sdpa
+  device: cuda
+
+prompt:
+  enable_thinking: true
+  system: "You are a careful mathematical reasoner. Solve the problem step by step and give the final answer clearly."
+  user_template: "{problem}"
+
+generation:
+  num_rollouts_per_problem: 8
+  rollout_batch_size: 2
+  max_new_tokens: 4096
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: true
+
+scoring:
+  logit_chunk_size: 128
+  compute_entropy: true
+  compute_exact_rank: true

@@ -1,0 +1,20 @@
+input_dir: runs/aime_qwen3_1p7b_vs_4b
+output_dir: runs/aime_qwen3_1p7b_vs_4b/analysis
+
+binning:
+  mode: fixed
+  logp_min: -12.0
+  logp_max: 0.0
+  bin_width: 0.5
+  num_quantile_bins: 20
+
+statistics:
+  central: median
+  show_iqr: true
+
+plot:
+  format: pdf
+  dpi: 200
+
+output:
+  write_consolidated_parquet: true
