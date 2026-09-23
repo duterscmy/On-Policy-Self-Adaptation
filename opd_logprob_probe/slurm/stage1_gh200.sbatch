@@ -6,6 +6,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
+#SBATCH --account=ehpc-reg-2026r01-278-gpu
+#SBATCH --partition=gpu
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 # Add cluster-specific --account and --partition lines if required.
