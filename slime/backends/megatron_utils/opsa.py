@@ -169,7 +169,7 @@ def compute_opsa(
         for x, log_prob in zip(flat_advantages.split(split_sizes), log_probs, strict=True)
     ]
     opsa_masks = [
-        x.reshape_as(loss_mask).to(dtype=loss_mask.dtype)
+        x.reshape_as(loss_mask)
         for x, loss_mask in zip(flat_opsa_mask.split(split_sizes), loss_masks, strict=True)
     ]
 
