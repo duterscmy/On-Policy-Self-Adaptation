@@ -380,9 +380,9 @@ slime-upstream/examples/opsa/run-qwen3-1.7B-opd-opsa-study.sh
 slime-upstream/examples/opsa/submit-qwen3-1.7B-opd-opsa-study.sh
 ```
 
-The production smoke is job `2957249`. The full suite is an `afterok`
-dependency chain, one four-GPU node at a time, 450 rollouts and at most 24
-hours per condition:
+The exact production-config smoke, job `2957249`, completed successfully and
+released the first long run. The full suite is an `afterok` dependency chain,
+one four-GPU node at a time, 450 rollouts and at most 24 hours per condition:
 
 ```text
 2957349  Vanilla OPD, all tokens
