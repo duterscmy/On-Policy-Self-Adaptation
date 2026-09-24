@@ -20,6 +20,17 @@ Most code changes should be made in `slime-upstream`.
 
 The current research goal is to study token-level learning signals in on-policy distillation and OPSA-style training, especially whether low-log-probability tokens are intrinsically more useful or are favored by the geometry of the standard sampled reverse-KL objective.
 
+Before substantial implementation or experimentation, also read:
+
+```text
+RESEARCH_SPEC.md
+PROJECT_HANDOFF.md
+```
+
+`PROJECT_HANDOFF.md` contains the latest operational constraints and known-good
+baseline snapshot. If it conflicts with an older operational note here, follow
+the stricter/latest handoff rule.
+
 ---
 
 ## Workspace Layout
@@ -259,18 +270,26 @@ Use the login node for:
 
 - reading/editing code
 - Git operations
-- lightweight Python checks
-- `compileall`
-- CPU unit tests
 - inspecting logs
 - preparing scripts
+- submitting/querying Slurm jobs
+- shell-only checks that do not execute the aarch64 Python environment
 
-Do NOT run GPU training on the login node.
+Do NOT activate `opsa-slime`, import the research Python stack, run `pytest`,
+install/build packages, convert models, or run rollout/training on the login
+node. The login node and GH200 compute nodes are different architecture/runtime
+environments, so a login-node import failure is not evidence that the runtime
+is broken.
 
 ### GPU Compute Node
 
 Use a GPU node for:
 
+- activating `opsa-slime`
+- PyTorch/CUDA, SGLang, Megatron, TransformerEngine, and Apex imports
+- tests that import the research stack
+- package installation/building for this environment
+- model conversion
 - SGLang rollout
 - Megatron forward/backward
 - smoke tests

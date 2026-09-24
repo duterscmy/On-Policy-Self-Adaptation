@@ -42,6 +42,9 @@ intrinsic to token informativeness or induced by sampled OPD loss geometry.
 See [the research specification](RESEARCH_SPEC.md) for the hypotheses,
 objectives, diagnostics, and experiment plan.
 
+For the current Arrhenius runtime boundary, known-good baselines, and immediate
+engineering state, see [the project handoff](PROJECT_HANDOFF.md).
+
 <p align="center">
   <img src="assets/opsa-overview.png" alt="Overview of On-Policy Self-Adaptation" width="96%">
 </p>
