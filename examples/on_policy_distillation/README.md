@@ -16,6 +16,11 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
 | `--use-opd` | Enable on-policy distillation. Required flag to use OPD. |
 | `--opd-type` | Type of OPD: `sglang` or `megatron`. Required when `--use-opd` is set. |
 | `--opd-kl-coef` | OPD KL penalty coefficient (default: 1.0). |
+| `--opd-loss-type` | `vanilla`, `geometry_corrected`, `bernoulli`, or detached-probability `weighted`. |
+| `--opd-token-filter` | `all`, `high_conf`, or DP-local `bottom_percent`; filtering applies only to the OPD term. |
+| `--opd-high-conf-threshold` | Strict student-probability threshold for `high_conf` (default: 0.5). |
+| `--opd-bottom-fraction` | Fraction of lowest-student-probability valid tokens for `bottom_percent` (default: 0.2). |
+| `--opd-geometry-alpha` | Exponent in the detached weight `(1-pS)^(-alpha)` (default: 0.5). |
 | `--opd-teacher-load` | Path to teacher checkpoint. **Required** when `--opd-type=megatron`, **must not be set** when `--opd-type=sglang`. |
 | `--opd-teacher-ckpt-step` | Optional checkpoint step for teacher model. |
 
@@ -26,6 +31,13 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
 | `sglang` | External SGLang server | Teacher has different architecture or larger than GPU memory |
 | `megatron` | Loaded into Megatron training | Teacher has same architecture as policy/ref model |
 
+The default `vanilla + all` combination retains the legacy sampled reverse-KL
+path. Non-default objectives separate the OPD term from the base reward
+advantage, so confidence filtering does not remove ordinary task-reward
+learning. `geometry_corrected` uses sampled-token log-odds, `bernoulli` uses
+the teacher sampled-token probability as a binary target, and `weighted`
+interpolates the sampled-token gradient geometry with `alpha`.
+
 ## Components
 
 - `slime/rollout/on_policy_distillation.py` implements (for SGLang mode):
@@ -33,6 +45,8 @@ This example shows how to run **on-policy distillation (OPD)** using slime. A sm
   - `post_process_rewards` trims the teacher logprobs to the generated response span and writes the tensors back to each `Sample` to compute advantages.
 - `run-qwen3-8B-opd.sh` launches an SGLang teacher server, then submits a Ray job that runs `train.py`.
 - `run-qwen3-8B-opd-megatron.sh` uses Megatron-loaded teacher model (no external server needed).
+- `../opsa/run-qwen3-1.7B-opd-opsa-study.sh` is the parameterized four-GPU
+  Qwen3-1.7B OPD/OPSA comparison used on Arrhenius.
 
 ## Running the example
 

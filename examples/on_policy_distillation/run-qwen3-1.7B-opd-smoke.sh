@@ -70,8 +70,15 @@ ROLLOUT_GPUS_PER_ENGINE="${ROLLOUT_GPUS_PER_ENGINE:-1}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
 N_SAMPLES="${N_SAMPLES:-2}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-1}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-256}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-2048}"
+
+OPD_LOSS_TYPE="${OPD_LOSS_TYPE:-vanilla}"
+OPD_TOKEN_FILTER="${OPD_TOKEN_FILTER:-all}"
+OPD_HIGH_CONF_THRESHOLD="${OPD_HIGH_CONF_THRESHOLD:-0.5}"
+OPD_BOTTOM_FRACTION="${OPD_BOTTOM_FRACTION:-0.2}"
+OPD_GEOMETRY_ALPHA="${OPD_GEOMETRY_ALPHA:-0.5}"
 
 if [[ -f "$DATA_ROOT/smoke-8.jsonl" ]]; then
   PROMPT_DATA="${PROMPT_DATA:-$DATA_ROOT/smoke-8.jsonl}"
@@ -101,6 +108,7 @@ echo "TP size: $TP_SIZE"
 echo "HF: $HF_CKPT"
 echo "MCore: $MCORE_CKPT"
 echo "data: $PROMPT_DATA"
+echo "OPD objective/filter: $OPD_LOSS_TYPE/$OPD_TOKEN_FILTER"
 echo "log: $LOG_FILE"
 echo "==============================="
 
@@ -117,7 +125,7 @@ ROLLOUT_ARGS=(
   --input-key prompt
   --apply-chat-template
   --rollout-shuffle
-  --num-rollout 1
+  --num-rollout "$NUM_ROLLOUT"
   --rollout-batch-size "$ROLLOUT_BATCH_SIZE"
   --n-samples-per-prompt "$N_SAMPLES"
   --rollout-max-response-len "$MAX_RESPONSE_LEN"
@@ -148,6 +156,11 @@ OPD_ARGS=(
   --use-opd
   --opd-type megatron
   --opd-kl-coef 1.0
+  --opd-loss-type "$OPD_LOSS_TYPE"
+  --opd-token-filter "$OPD_TOKEN_FILTER"
+  --opd-high-conf-threshold "$OPD_HIGH_CONF_THRESHOLD"
+  --opd-bottom-fraction "$OPD_BOTTOM_FRACTION"
+  --opd-geometry-alpha "$OPD_GEOMETRY_ALPHA"
   --opd-teacher-load "$MCORE_CKPT"
   --use-kl-loss
   --kl-loss-coef 0.0

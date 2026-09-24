@@ -589,6 +589,7 @@ def train_one_step(
                     "response_lengths",
                     "loss_masks",
                     "opsa_loss_mask",
+                    "opd_loss_mask",
                     "log_probs",
                     "ref_log_probs",
                     "values",

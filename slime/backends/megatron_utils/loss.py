@@ -36,6 +36,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+from .opd import compute_opd_selection, compute_opd_token_loss, uses_direct_opd_objective
 from .opsa import compute_opsa
 
 ROLLOUT_TOP_P_TOKEN_KEYS = (
@@ -672,6 +673,9 @@ def apply_opd_kl_to_advantages(
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
+    loss_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
 ) -> None:
     """Apply on-policy distillation KL penalty to advantages.
 
@@ -697,6 +701,36 @@ def apply_opd_kl_to_advantages(
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size > 1:
+        full_student_log_probs = [
+            all_gather_with_cp(log_prob, total_length, response_length)
+            for log_prob, total_length, response_length in zip(
+                student_log_probs, total_lengths, response_lengths, strict=True
+            )
+        ]
+        full_teacher_log_probs = [
+            all_gather_with_cp(log_prob, total_length, response_length)
+            for log_prob, total_length, response_length in zip(
+                teacher_log_probs, total_lengths, response_lengths, strict=True
+            )
+        ]
+    else:
+        full_student_log_probs = student_log_probs
+        full_teacher_log_probs = teacher_log_probs
+
+    selection = compute_opd_selection(
+        full_student_log_probs,
+        full_teacher_log_probs,
+        loss_masks,
+        token_filter=args.opd_token_filter,
+        high_conf_threshold=args.opd_high_conf_threshold,
+        bottom_fraction=args.opd_bottom_fraction,
+        geometry_alpha=args.opd_geometry_alpha,
+    )
+    rollout_data["opd_loss_mask"] = selection.loss_masks
+    rollout_data.update(selection.metrics)
 
     reverse_kls = []
     for i, adv in enumerate(advantages):
@@ -896,6 +930,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             rollout_data=rollout_data,
             advantages=advantages,
             student_log_probs=log_probs,
+            loss_masks=loss_masks,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
         )
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
@@ -1195,6 +1232,8 @@ def policy_loss_function(
     advantages = torch.cat(batch["advantages"], dim=0)
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch.get("log_probs")
     opsa_loss_mask = batch.get("opsa_loss_mask")
+    opd_loss_mask = batch.get("opd_loss_mask")
+    direct_opd_objective = uses_direct_opd_objective(args)
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -1264,6 +1303,22 @@ def policy_loss_function(
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
+
+    opd_token_loss = None
+    if direct_opd_objective:
+        teacher_log_probs = torch.cat(batch["teacher_log_probs"], dim=0).to(device=log_probs.device)
+        opd_advantage = args.opd_kl_coef * (teacher_log_probs.detach() - old_log_probs.detach())
+        # Advantages already contain the legacy OPD log-ratio term. Remove it
+        # from the base policy loss before adding the requested direct objective.
+        advantages = advantages - opd_advantage.to(dtype=advantages.dtype)
+        opd_token_loss = compute_opd_token_loss(
+            log_probs,
+            old_log_probs,
+            teacher_log_probs,
+            loss_type=args.opd_loss_type,
+            coef=args.opd_kl_coef,
+            geometry_alpha=args.opd_geometry_alpha,
+        )
 
     if pg_loss_type == "reinforce":
         pg_loss = -advantages.detach() * log_probs
@@ -1367,6 +1422,23 @@ def policy_loss_function(
         pg_loss_reducer = selected_pg_loss_reducer or sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
+    opd_objective_loss = None
+    if opd_token_loss is not None:
+        if opd_loss_mask is None:
+            raise ValueError("Direct OPD objective requires opd_loss_mask in the training batch.")
+        selected_opd_masks = [
+            response_mask.to(device=mask.device, dtype=mask.dtype) * mask
+            for response_mask, mask in zip(batch["loss_masks"], opd_loss_mask, strict=True)
+        ]
+        opd_loss_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            selected_opd_masks,
+            None,
+            args.calculate_per_token_loss,
+        )
+        opd_objective_loss = opd_loss_reducer(opd_token_loss)
+        pg_loss = pg_loss + opd_objective_loss
     pg_clipfrac = (selected_pg_loss_reducer or sum_of_sample_mean)(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
@@ -1420,6 +1492,9 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if opd_objective_loss is not None:
+        reported_loss["opd/objective_loss"] = opd_objective_loss.clone().detach()
 
     if opsa_loss_mask is not None:
         selected = (advantages != 0).to(dtype=advantages.dtype)

@@ -1190,6 +1190,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
             )
             parser.add_argument(
+                "--opd-loss-type",
+                type=str,
+                choices=["vanilla", "geometry_corrected", "bernoulli", "weighted"],
+                default="vanilla",
+                help="Token-level OPD objective. The vanilla default preserves the original implementation.",
+            )
+            parser.add_argument(
+                "--opd-token-filter",
+                type=str,
+                choices=["all", "high_conf", "bottom_percent"],
+                default="all",
+                help="Tokens receiving the OPD objective; base reward learning remains unfiltered.",
+            )
+            parser.add_argument(
+                "--opd-high-conf-threshold",
+                type=float,
+                default=0.5,
+                help="Strict student-probability threshold used by --opd-token-filter=high_conf.",
+            )
+            parser.add_argument(
+                "--opd-bottom-fraction",
+                type=float,
+                default=0.2,
+                help="DP-local fraction selected by --opd-token-filter=bottom_percent.",
+            )
+            parser.add_argument(
+                "--opd-geometry-alpha",
+                type=float,
+                default=0.5,
+                help="Detached (1-pS)^(-alpha) exponent for --opd-loss-type=weighted.",
+            )
+            parser.add_argument(
                 "--opd-teacher-load",
                 type=str,
                 default=None,
@@ -1835,12 +1867,14 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    from slime.backends.megatron_utils.opd import validate_opd_args
     from slime.backends.megatron_utils.opsa import validate_opsa_args
     from slime.utils.ppo_utils import get_pg_loss_type
     from slime.utils.score_centering import validate_score_centering_args
 
     get_pg_loss_type(args)
     validate_score_centering_args(args)
+    validate_opd_args(args)
     validate_opsa_args(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
