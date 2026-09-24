@@ -330,3 +330,71 @@ The core question remains:
 > Does OPD focus on low-confidence tokens because those tokens intrinsically
 > contain more useful learning signal, or because the standard sampled
 > reverse-KL objective assigns them disproportionately large gradients?
+
+## 10. Current implementation and experiment queue (2026-09-25)
+
+The parameterized OPD objective implementation is on `opsa-port` at commit:
+
+```text
+d3d1d670 Gate OPD study suite on smoke validation
+c2788efb Add parameterized OPD objective study
+```
+
+Implemented loss types and filters:
+
+```text
+--opd-loss-type vanilla|geometry_corrected|bernoulli|weighted
+--opd-token-filter all|high_conf|bottom_percent
+--opd-high-conf-threshold 0.5
+--opd-bottom-fraction 0.2
+--opd-geometry-alpha 0.5
+```
+
+The default `vanilla + all` path remains on the legacy advantage/PPO path.
+Non-default variants separate the OPD term from the base reward advantage so
+OPD token filtering does not filter task-reward learning. The implementation
+also logs student/teacher probabilities, log-ratio and probability-gap
+statistics, ten student-probability bins, selected fractions, and analytic
+gradient-mass proxies.
+
+Validation completed on Slurm GH200 compute nodes:
+
+```text
+unit/gradient tests: job 2956338, 10 passed
+four-GPU GC + high-confidence smoke: job 2956607, Ray succeeded
+selected tokens in smoke: 917 / 1024 = 0.8955078125
+```
+
+The pinned AIME24 evaluation file is now present at:
+
+```text
+/nobackup/proj/disk/ehpc-reg-2026r01-278/personal/mingyu/opsa/data/aime-2024/aime-2024.jsonl
+```
+
+It has 30 rows and the required `prompt` and `label` fields.
+
+The production launcher and serial submitter are:
+
+```text
+slime-upstream/examples/opsa/run-qwen3-1.7B-opd-opsa-study.sh
+slime-upstream/examples/opsa/submit-qwen3-1.7B-opd-opsa-study.sh
+```
+
+The production smoke is job `2957249`. The full suite is an `afterok`
+dependency chain, one four-GPU node at a time, 450 rollouts and at most 24
+hours per condition:
+
+```text
+2957349  Vanilla OPD, all tokens
+2957350  fixed OPSA, bottom 20%
+2957351  geometry-corrected OPD, all tokens
+2957352  high-confidence Vanilla OPD
+2957353  high-confidence geometry-corrected OPD
+2957354  Bernoulli OPD, all tokens
+2957355  weighted OPD, alpha=0.5, all tokens
+```
+
+The chain is intentionally fail-closed: a failed smoke or condition prevents
+later jobs from starting and wasting GPU time. Slurm wrapper and inner Ray
+logs are under `/opsa/logs`; checkpoints are under `/opsa/outputs` and are not
+committed.
