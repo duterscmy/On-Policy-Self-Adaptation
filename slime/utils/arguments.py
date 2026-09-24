@@ -968,6 +968,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
+                    "opsa",
                 ],
                 default="grpo",
                 help=(
@@ -1199,6 +1200,37 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            parser.add_argument(
+                "--opsa-mode",
+                type=str,
+                choices=["entropy", "fixed"],
+                default="entropy",
+                help="Baseline OPSA mode: entropy-ranked or fixed advantages on lowest-logp tokens.",
+            )
+            parser.add_argument(
+                "--opsa-token-fraction",
+                type=float,
+                default=0.2,
+                help="Fraction of valid response tokens selected by lowest current-actor log-probability.",
+            )
+            parser.add_argument(
+                "--opsa-advantage-min",
+                type=float,
+                default=-1.0,
+                help="Most negative entropy-ranked OPSA advantage.",
+            )
+            parser.add_argument(
+                "--opsa-advantage-max",
+                type=float,
+                default=-0.5,
+                help="Least negative entropy-ranked OPSA advantage.",
+            )
+            parser.add_argument(
+                "--opsa-fixed-advantage",
+                type=float,
+                default=None,
+                help="Non-zero advantage required by --opsa-mode=fixed.",
             )
             return parser
 
@@ -1803,11 +1835,13 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    from slime.backends.megatron_utils.opsa import validate_opsa_args
     from slime.utils.ppo_utils import get_pg_loss_type
     from slime.utils.score_centering import validate_score_centering_args
 
     get_pg_loss_type(args)
     validate_score_centering_args(args)
+    validate_opsa_args(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.rollout_temperature <= 0:
