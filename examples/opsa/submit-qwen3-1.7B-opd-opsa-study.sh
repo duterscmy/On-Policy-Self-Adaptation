@@ -14,7 +14,8 @@ TIME_LIMIT="${TIME_LIMIT:-24:00:00}"
 [[ -x "$RUNNER" ]] || { echo "ERROR: runner is not executable: $RUNNER" >&2; exit 1; }
 mkdir -p "$OPSA_ROOT/logs"
 
-previous_job=""
+# Set AFTEROK_JOB to gate the entire suite on a separate smoke/validation job.
+previous_job="${AFTEROK_JOB:-}"
 
 submit_condition() {
   local name="$1"
