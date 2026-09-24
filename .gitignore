@@ -196,3 +196,17 @@ _examples_synced/
 # Local backup files
 *.bak
 *.orig
+
+# Arrhenius-local runtime state and large artifacts
+/models/
+/data/
+/logs/
+/Megatron-LM/
+/TransformerEngine/
+/sglang/
+/sgl-router/
+/slime-upstream/
+/opd_logprob_probe/runs/
+/opd_logprob_probe/*.zip
+/slime/*.tar.gz
+*.tar.gz

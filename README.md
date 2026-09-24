@@ -37,6 +37,11 @@ of valid response tokens with the lowest actor log probabilities and assigns
 entropy-adaptive negative advantages between `-0.5` and `-1.0`. All other
 tokens are excluded from the policy loss.
 
+The current follow-up research studies whether this low-confidence focus is
+intrinsic to token informativeness or induced by sampled OPD loss geometry.
+See [the research specification](RESEARCH_SPEC.md) for the hypotheses,
+objectives, diagnostics, and experiment plan.
+
 <p align="center">
   <img src="assets/opsa-overview.png" alt="Overview of On-Policy Self-Adaptation" width="96%">
 </p>
@@ -73,6 +78,27 @@ git clone https://github.com/DripNowhy/On-Policy-Self-Adaptation.git
 cd On-Policy-Self-Adaptation/slime
 pip install -e .
 ```
+
+### Arrhenius / Slurm execution policy
+
+The login node must only be used for code editing, Git operations, lightweight
+CPU checks, and Slurm job submission.
+
+Any import or execution involving the `opsa-slime` aarch64/GH200 runtime,
+PyTorch CUDA, SGLang, Megatron-LM, TransformerEngine, Apex, or GPU smoke tests
+must run on a compute node obtained through Slurm. Do not validate the GPU
+environment directly on the login node.
+
+Interactive compute resources can be requested with the allocation helpers
+in the workspace root:
+
+```bash
+bash alloc_debug_1gpu.sh
+bash alloc_debug_gpu2.sh
+```
+
+Codex may request compute resources itself with these documented Slurm
+commands when GPU-runtime validation is required.
 
 <a id="dataset-preparation"></a>
 
