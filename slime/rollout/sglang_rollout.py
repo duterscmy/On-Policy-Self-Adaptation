@@ -577,6 +577,7 @@ async def eval_rollout_single_dataset(
             if eval_apply_chat_template_kwargs is not None
             else None
         ),
+        getattr(args, "disable_thinking", False),
     )
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -593,6 +594,7 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=eval_apply_chat_template,
             apply_chat_template_kwargs=eval_apply_chat_template_kwargs,
+            disable_thinking=getattr(args, "disable_thinking", False),
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 

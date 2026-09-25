@@ -227,6 +227,7 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        disable_thinking=False,
     ):
         origin_samples = []
         for data in read_file(path):
@@ -246,12 +247,15 @@ class Dataset:
                 metadata["tools"] = tools
 
             if apply_chat_template:
+                chat_template_kwargs = dict(apply_chat_template_kwargs or {})
+                if disable_thinking:
+                    chat_template_kwargs["enable_thinking"] = False
                 output_prompt = tokenizer.apply_chat_template(
                     prompt,
                     tools=tools,
                     tokenize=False,
                     add_generation_prompt=True,
-                    **(apply_chat_template_kwargs or {}),
+                    **chat_template_kwargs,
                 )
             else:
                 output_prompt = prompt

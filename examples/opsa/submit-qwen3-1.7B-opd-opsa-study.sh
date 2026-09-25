@@ -14,6 +14,7 @@ INCLUDE_VANILLA="${INCLUDE_VANILLA:-1}"
 INCLUDE_OPSA_ENTROPY="${INCLUDE_OPSA_ENTROPY:-1}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-4}"
 RUN_SUFFIX="${RUN_SUFFIX:-}"
+JOB_SUFFIX="${JOB_SUFFIX:-}"
 
 [[ -x "$RUNNER" ]] || { echo "ERROR: runner is not executable: $RUNNER" >&2; exit 1; }
 mkdir -p "$OPSA_ROOT/logs"
@@ -29,7 +30,7 @@ submit_condition() {
       --nodes=1 \
       --gres=gpu:4 \
       --time="$TIME_LIMIT" \
-      --job-name="$name" \
+      --job-name="$name$JOB_SUFFIX" \
       --output="$OPSA_ROOT/logs/study-%x-%j.log" \
       --export="ALL,NUM_ROLLOUT=200,EVAL_INTERVAL=20,SAVE_INTERVAL=20,N_SAMPLES_PER_EVAL_PROMPT=$EVAL_SAMPLES,RETAIN_BEST_AND_LAST=1,$exports" \
       "$RUNNER"
