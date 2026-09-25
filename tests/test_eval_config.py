@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from slime.utils.eval_config import build_eval_dataset_configs
+from slime.utils.arguments import _resolve_eval_datasets
 
 
 NUM_GPUS = 0
@@ -121,6 +122,22 @@ def test_eval_rm_type_overrides_training_rm_type():
     )
 
     assert datasets[0].rm_type == "math"
+
+
+@pytest.mark.unit
+def test_explicit_eval_rm_type_does_not_inherit_training_custom_rm():
+    args = _args(
+        eval_config=None,
+        eval_prompt_data=["aime", "/d/aime.jsonl"],
+        eval_rm_type="math",
+        eval_custom_rm_path=None,
+        custom_rm_path="slime.rollout.opsa.reward_func",
+    )
+
+    datasets = _resolve_eval_datasets(args)
+
+    assert datasets[0].rm_type == "math"
+    assert datasets[0].custom_rm_path is None
 
 
 if __name__ == "__main__":

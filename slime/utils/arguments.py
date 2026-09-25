@@ -824,6 +824,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Rule-based reward type used for evaluation datasets, overriding the training reward hook.",
             )
             parser.add_argument(
+                "--eval-custom-rm-path",
+                type=str,
+                default=None,
+                help="Optional evaluation-only custom reward function path.",
+            )
+            parser.add_argument(
                 "--n-samples-per-eval-prompt",
                 type=int,
                 default=1,
@@ -1862,6 +1868,12 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
         datasets_config = [{"name": values[i], "path": values[i + 1]} for i in range(0, len(values), 2)]
     else:
         datasets_config = []
+
+    # An explicit rule-based eval scorer must not inherit a training-only
+    # custom reward hook. A dataset entry or --eval-custom-rm-path can still
+    # opt into an evaluation-specific custom function.
+    if args.eval_rm_type is not None and args.eval_custom_rm_path is None:
+        defaults.setdefault("custom_rm_path", None)
 
     eval_datasets = build_eval_dataset_configs(args, datasets_config, defaults)
     if eval_datasets:
