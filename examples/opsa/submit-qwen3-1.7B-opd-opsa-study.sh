@@ -11,6 +11,9 @@ ACCOUNT="${SLURM_ACCOUNT:-ehpc-reg-2026r01-278-gpu}"
 PARTITION="${SLURM_PARTITION:-gpu}"
 TIME_LIMIT="${TIME_LIMIT:-24:00:00}"
 INCLUDE_VANILLA="${INCLUDE_VANILLA:-1}"
+INCLUDE_OPSA_ENTROPY="${INCLUDE_OPSA_ENTROPY:-1}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-4}"
+RUN_SUFFIX="${RUN_SUFFIX:-}"
 
 [[ -x "$RUNNER" ]] || { echo "ERROR: runner is not executable: $RUNNER" >&2; exit 1; }
 mkdir -p "$OPSA_ROOT/logs"
@@ -28,7 +31,7 @@ submit_condition() {
       --time="$TIME_LIMIT" \
       --job-name="$name" \
       --output="$OPSA_ROOT/logs/study-%x-%j.log" \
-      --export="ALL,NUM_ROLLOUT=200,EVAL_INTERVAL=20,SAVE_INTERVAL=20,RETAIN_BEST_AND_LAST=1,$exports" \
+      --export="ALL,NUM_ROLLOUT=200,EVAL_INTERVAL=20,SAVE_INTERVAL=20,N_SAMPLES_PER_EVAL_PROMPT=$EVAL_SAMPLES,RETAIN_BEST_AND_LAST=1,$exports" \
       "$RUNNER"
   )"
   echo "$name $job_id"
@@ -37,17 +40,21 @@ submit_condition() {
 # Set INCLUDE_VANILLA=0 when a compatible vanilla baseline is already running.
 if [[ "$INCLUDE_VANILLA" == "1" ]]; then
   submit_condition "opd-vanilla" \
-    "RUN_NAME=opd-vanilla-all,METHOD=opd,OPD_LOSS_TYPE=vanilla,OPD_TOKEN_FILTER=all"
+    "RUN_NAME=opd-vanilla-all${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=vanilla,OPD_TOKEN_FILTER=all"
 fi
 submit_condition "opsa-fixed" \
-  "RUN_NAME=opsa-fixed-bottom20,METHOD=opsa,OPSA_MODE=fixed,OPSA_TOKEN_FRACTION=0.2"
+  "RUN_NAME=opsa-fixed-bottom20${RUN_SUFFIX},METHOD=opsa,OPSA_MODE=fixed,OPSA_TOKEN_FRACTION=0.2"
+if [[ "$INCLUDE_OPSA_ENTROPY" == "1" ]]; then
+  submit_condition "opsa-entropy" \
+    "RUN_NAME=opsa-entropy-bottom20${RUN_SUFFIX},METHOD=opsa,OPSA_MODE=entropy,OPSA_TOKEN_FRACTION=0.2"
+fi
 submit_condition "opd-gc" \
-  "RUN_NAME=opd-gc-all,METHOD=opd,OPD_LOSS_TYPE=geometry_corrected,OPD_TOKEN_FILTER=all"
+  "RUN_NAME=opd-gc-all${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=geometry_corrected,OPD_TOKEN_FILTER=all"
 submit_condition "opd-hc-vanilla" \
-  "RUN_NAME=opd-vanilla-highconf,METHOD=opd,OPD_LOSS_TYPE=vanilla,OPD_TOKEN_FILTER=high_conf"
+  "RUN_NAME=opd-vanilla-highconf${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=vanilla,OPD_TOKEN_FILTER=high_conf"
 submit_condition "opd-hc-gc" \
-  "RUN_NAME=opd-gc-highconf,METHOD=opd,OPD_LOSS_TYPE=geometry_corrected,OPD_TOKEN_FILTER=high_conf"
+  "RUN_NAME=opd-gc-highconf${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=geometry_corrected,OPD_TOKEN_FILTER=high_conf"
 submit_condition "opd-bernoulli" \
-  "RUN_NAME=opd-bernoulli-all,METHOD=opd,OPD_LOSS_TYPE=bernoulli,OPD_TOKEN_FILTER=all"
+  "RUN_NAME=opd-bernoulli-all${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=bernoulli,OPD_TOKEN_FILTER=all"
 submit_condition "opd-weighted" \
-  "RUN_NAME=opd-weighted-a0p5,METHOD=opd,OPD_LOSS_TYPE=weighted,OPD_TOKEN_FILTER=all,OPD_GEOMETRY_ALPHA=0.5"
+  "RUN_NAME=opd-weighted-a0p5${RUN_SUFFIX},METHOD=opd,OPD_LOSS_TYPE=weighted,OPD_TOKEN_FILTER=all,OPD_GEOMETRY_ALPHA=0.5"

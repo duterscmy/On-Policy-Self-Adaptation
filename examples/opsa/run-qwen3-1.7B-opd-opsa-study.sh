@@ -53,6 +53,7 @@ EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
+N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-4}"
 RETAIN_BEST_AND_LAST="${RETAIN_BEST_AND_LAST:-1}"
 RETENTION_METRIC="${RETENTION_METRIC:-eval/aime}"
 SEED="${SEED:-1234}"
@@ -104,6 +105,7 @@ echo "actor/rollout GPUs:    $ACTOR_GPUS / $ROLLOUT_GPUS"
 echo "rollouts:              $NUM_ROLLOUT"
 echo "batch:                 $ROLLOUT_BATCH_SIZE x $N_SAMPLES = $GLOBAL_BATCH_SIZE"
 echo "response/eval length:  $MAX_RESPONSE_LEN / $EVAL_MAX_RESPONSE_LEN"
+echo "eval samples/prompt:    $N_SAMPLES_PER_EVAL_PROMPT"
 echo "save dir:              $SAVE_DIR"
 echo "log:                   $LOG_FILE"
 echo "================================================"
@@ -155,7 +157,7 @@ EVAL_ARGS=(
   --eval-prompt-data aime "$EVAL_DATA"
   --eval-input-key prompt
   --eval-label-key label
-  --n-samples-per-eval-prompt 4
+  --n-samples-per-eval-prompt "$N_SAMPLES_PER_EVAL_PROMPT"
   --eval-max-response-len "$EVAL_MAX_RESPONSE_LEN"
   --eval-top-p 0.8
   --eval-temperature 0.7
@@ -226,6 +228,7 @@ SGLANG_ARGS=(
   --rollout-num-gpus-per-engine "$ROLLOUT_GPUS_PER_ENGINE"
   --sglang-mem-fraction-static 0.65
   --sglang-attention-backend triton
+  --sglang-enable-deterministic-inference
 )
 
 MISC_ARGS=(
