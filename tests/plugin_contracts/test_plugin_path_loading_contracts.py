@@ -368,5 +368,23 @@ def test_custom_rm_path_aligns_with_expected_format():
         assert isinstance(reward, (int, float))
 
 
+def test_eval_rm_type_overrides_training_custom_rm(monkeypatch):
+    samples = [make_sample(0), make_sample(1)]
+    for sample in samples:
+        sample.metadata["rm_type"] = "random"
+    monkeypatch.setattr("slime.rollout.rm_hub.random.randint", lambda _low, _high: 1)
+
+    rewards = asyncio.run(
+        batched_async_rm(
+            make_args(
+                custom_rm_path="plugin_contracts.test_plugin_path_loading_contracts.reference_batched_rm",
+            ),
+            samples,
+        )
+    )
+
+    assert rewards == [1, 1]
+
+
 if __name__ == "__main__":
     run_contract_test_file()

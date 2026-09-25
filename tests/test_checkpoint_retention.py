@@ -48,3 +48,21 @@ def test_retention_plan_keeps_latest_tied_best_and_final(tmp_path):
         "retained_steps": [59, 199],
         "removed_steps": [19, 39],
     }
+
+
+def test_retention_plan_does_not_prune_an_all_zero_eval_history(tmp_path):
+    save_dir = tmp_path / "checkpoints"
+    save_dir.mkdir()
+    for step in (19, 39, 59):
+        _checkpoint(save_dir, step)
+    log = tmp_path / "run.log"
+    log.write_text(
+        "eval 19: {'eval/aime': 0.0}\n"
+        "eval 39: {'eval/aime': 0.0}\n"
+        "eval 59: {'eval/aime': 0.0}\n",
+        encoding="utf-8",
+    )
+
+    plan = retention_plan(save_dir, log, "eval/aime")
+    assert plan["retained_steps"] == [19, 39, 59]
+    assert plan["removed_steps"] == []

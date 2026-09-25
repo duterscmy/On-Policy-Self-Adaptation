@@ -58,12 +58,14 @@ async def async_rm(args, sample: Sample, **kwargs):
         rm_function = load_function(sample.custom_rm_path)
         return await rm_function(args, sample, **kwargs)
 
-    if args.custom_rm_path is not None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+    # Dataset-specific evaluation metadata must override a training-only
+    # custom RM (for example OPSA's zero scalar-reward hook).
+    if not rm_type and args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, sample, **kwargs)
 
-    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
     response = sample.response
     label = sample.label
     if rm_type.startswith("boxed_"):
@@ -101,7 +103,12 @@ async def batched_async_rm(
     samples: list[Sample],
     **kwargs,
 ) -> list[int | float]:
-    if args.custom_rm_path is not None:
+    has_sample_override = any(
+        sample.custom_rm_path
+        or (isinstance(sample.metadata, dict) and sample.metadata.get("rm_type"))
+        for sample in samples
+    )
+    if args.custom_rm_path is not None and not has_sample_override:
         # Ensure the custom reward function is implemented in batch mode
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, samples, **kwargs)

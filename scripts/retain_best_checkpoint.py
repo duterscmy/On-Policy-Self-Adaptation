@@ -50,7 +50,12 @@ def retention_plan(save_dir: Path, log_file: Path, metric: str) -> dict:
     # Prefer the later checkpoint when several evaluations share the best score.
     best_step = max(scored_checkpoints, key=lambda step: (scored_checkpoints[step], step))
     last_step = max(checkpoints)
-    retained_steps = sorted({best_step, last_step})
+    # All-zero evaluation histories commonly indicate a scorer-routing error.
+    # Keep every candidate rather than irreversibly pruning on invalid evidence.
+    if set(scored_checkpoints.values()) == {0.0}:
+        retained_steps = sorted(checkpoints)
+    else:
+        retained_steps = sorted({best_step, last_step})
     removed_steps = sorted(set(checkpoints) - set(retained_steps))
     return {
         "metric": metric,
