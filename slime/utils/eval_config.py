@@ -56,6 +56,11 @@ DATASET_RUNTIME_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 DATASET_SAMPLE_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
+    "rm_type": {
+        "dataset_keys": ("rm_type",),
+        "default_keys": ("rm_type",),
+        "arg_attrs": ("eval_rm_type", "rm_type"),
+    },
     "input_key": {
         "dataset_keys": ("input_key",),
         "default_keys": ("input_key",),

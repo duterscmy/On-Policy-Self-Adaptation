@@ -818,6 +818,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument("--eval-tool-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
+                "--eval-rm-type",
+                type=str,
+                default=None,
+                help="Rule-based reward type used for evaluation datasets, overriding the training reward hook.",
+            )
+            parser.add_argument(
                 "--n-samples-per-eval-prompt",
                 type=int,
                 default=1,

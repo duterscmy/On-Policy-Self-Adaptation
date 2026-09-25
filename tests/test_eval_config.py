@@ -112,5 +112,16 @@ def test_spec_fields_still_fall_back_to_args():
     assert datasets[0].temperature == 0.9
 
 
+@pytest.mark.unit
+def test_eval_rm_type_overrides_training_rm_type():
+    datasets = build_eval_dataset_configs(
+        _args(eval_rm_type="math", rm_type=None),
+        [{"name": "aime", "path": "/d/aime.jsonl"}],
+        defaults={},
+    )
+
+    assert datasets[0].rm_type == "math"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
